@@ -251,7 +251,13 @@ async def agent_analyze_chunk(
 ) -> dict:
     llm_nodes = _filter_llm_nodes(nodes)
     doc_view = _render_nodes_html(llm_nodes)
-    prompt_sys = "당신은 한국 정부 R&D 양식 분석 전문가입니다."
+    prompt_sys = (
+        "당신은 HWPX 양식 분석 전문가입니다. "
+        "현재 상황: 사용자가 HWPX 양식을 업로드했으며, 우리는 이를 분석해 "
+        "실제 값을 채우기 위한 계획(분류 결과)을 만드는 단계입니다. "
+        "가능하면 개별 규칙에 과도하게 집착하지 말고, 표의 전체 구조와 행/열의 역할을 "
+        "종합적으로 보고 자율적으로 판단하세요."
+    )
     table_summary_section = ""
     if table_summaries:
         chunk_table_idxs = {n.table_idx for n in nodes if n.type == "table_cell"}
@@ -293,6 +299,11 @@ tables_to_remove에 그 표 인덱스를 추가하세요.
   {{"id":149,"category":"instruction","action":"keep","skip_fill":true,"reason":"작성 요령 표(삭제 대상)"}}
 ]}}
 
+또 다른 예시(간단): 데이터 행에서 첫 열만 반복적으로 채워지고
+나머지 열이 비어 있으며 번호/항목 패턴이면 placeholder로 분류합니다.
+예: <tr><td data-id="213">기술 지표 1</td><td></td><td></td></tr>
+출력: {{"id":213,"category":"placeholder","action":"replace","skip_fill":false}}
+
 ## 작업
 1) 각 노드를 분류하세요:
    - label: 라벨/제목 (수정 불가)
@@ -311,14 +322,25 @@ tables_to_remove에 그 표 인덱스를 추가하세요.
    - data-style에 color 정보가 있거나, data-size가 큰 셀(예: 150mm 이상)인 경우
 7) 표의 데이터 행에서 "용어", "정의", "설명" 같은 일반 라벨이 반복되면
    instruction이 아니라 placeholder( action=replace )로 분류하세요.
-8) 표 셀 중 높이(H)가 10mm 이하이고, 바로 아래에 상세 설명 셀이 이어지는 경우
+8) 표의 데이터 행에서 "첫 열만 채워지고 나머지 열이 비어 있음"이 여러 행 반복되고,
+   첫 열 텍스트가 짧거나 번호/항목 패턴(예: 1, 2, 3, 1), 2), 1., 2.) 등)이면
+   예시/임시 라벨로 보고 placeholder( action=replace, skip_fill=false )로 분류하세요.
+9) fixed는 "실제 문맥 고유값"일 때만 사용하세요. 아래 유형은 기본적으로
+   placeholder로 분류하세요:
+   - 순번이 붙은 항목명(예: 항목 1/2/3, 지표 1/2/3, 항목 A/B/C)
+   - 너무 일반적인 라벨(예: 항목, 세부항목, 내용, 기타)
+   - 프로젝트/문서 맥락 없이도 성립하는 샘플/예시 텍스트
+   특히 표 헤더가 "지표명/항목명/성과지표명"처럼 이름을 받는 열이면,
+   데이터 행 첫 열의 텍스트가 존재하더라도 fixed로 잠그지 말고
+   placeholder로 분류하세요.
+10) 표 셀 중 높이(H)가 10mm 이하이고, 바로 아래에 상세 설명 셀이 이어지는 경우
    위 셀은 role="summary_header", 아래 셀은 role="detail_body"로 지정하고
    summary_header에는 detail_node(아래 셀 id), detail_body에는 header_node(위 셀 id)를 기록하세요.
    요약 셀의 권장 글자수는 max_chars에 적어주세요.
-9) 셀 내용에 "그림", "이미지", "개념도", "도식", "차트", "그래프" 등이 포함되면
+11) 셀 내용에 "그림", "이미지", "개념도", "도식", "차트", "그래프" 등이 포함되면
    image_placeholder로 분류하고 action=keep, skip_fill=true로 지정하세요.
    image_prompt, image_caption, image_ratio(16:9 또는 4:3)를 추가로 작성하세요.
-10) "삭제" 또는 "없을 시 표 삭제" 같은 문구가 있으면 delete=true를 추가하세요.
+12) "삭제" 또는 "없을 시 표 삭제" 같은 문구가 있으면 delete=true를 추가하세요.
    (delete=true는 최종 단계에서 해당 노드를 제거하는 신호입니다.)
 
 ## 출력(JSON)

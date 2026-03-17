@@ -2,3 +2,4 @@ fastmcp
 requests
 openai
 google-genai
+supabase
