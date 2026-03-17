@@ -63,7 +63,7 @@ def apply_fills(
     remove_table_signatures = {
         table_first_cell[tbl_idx]
         for tbl_idx in remove_table_indices
-        if tbl_idx in table_first_cell
+        if tbl_idx in table_first_cell and table_first_cell[tbl_idx]
     }
 
     def _remove_instruction_content(root: ET.Element):
@@ -140,6 +140,12 @@ def apply_fills(
             if find_parent(tbl, local_parent, "tbl") is not None:
                 continue
             tbl_index += 1
+            if tbl_index in remove_table_indices:
+                parent = local_parent.get(tbl)
+                if parent is not None:
+                    if _safe_remove(parent, tbl):
+                        tbl_removed += 1
+                continue
             first_cell_text = ""
             for tc in tbl.iter():
                 if tag(tc) != "tc":

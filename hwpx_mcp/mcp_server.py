@@ -17,6 +17,7 @@ from supabase import create_client
 from .config import DEBUG_OUTPUT_DIR, DEBUG_OUTPUT_ENABLED, LOG_PATH
 from .runner import process_hwpx_file
 from .hwpx_to_html import hwpx_to_html
+from .hwpx_edit import apply_html_edits_to_hwpx
 
 
 def _setup_logging() -> logging.Logger:
@@ -86,6 +87,12 @@ def _build_output_basename(report_topic: str) -> str:
         safe_topic = "report"
     stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     return f"filled-{safe_topic}_{stamp}"
+
+
+def _build_edit_basename(filename: str) -> str:
+    safe = _safe_storage_name(filename or "output.hwpx").replace(".hwpx", "")
+    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    return f"edited-{safe}_{stamp}"
 
 
 def _extract_public_url(response: object) -> Optional[str]:
@@ -198,7 +205,7 @@ async def generate_hwpx(
         file_url = _upload_hwpx_to_storage(output_path, output_name)
         html_url = ""
         try:
-            hwpx_to_html(output_path, html_output_path, use_lineseg=False)
+            hwpx_to_html(output_path, html_output_path, use_lineseg=False, inject_ids=True)
             html_url = _upload_html_to_storage(html_output_path, output_html_name)
         except Exception as e:
             logger.warning("HTML 변환 실패 (HWPX만 반환): %s", e)
@@ -211,6 +218,64 @@ async def generate_hwpx(
     logger.info("generate_hwpx done: output=%s url=%s", output_name, file_url)
     return {
         "file_name": output_name,
+        "content_type": HWPX_CONTENT_TYPE,
+        "file_url": file_url,
+        "html_name": output_html_name if html_url else "",
+        "html_content_type": HTML_CONTENT_TYPE if html_url else "",
+        "html_url": html_url,
+    }
+
+
+@mcp.tool
+async def save_hwpx_from_html(
+    hwpx_url: Annotated[str, Field(description="원본 HWPX URL")],
+    edited_html: Annotated[str, Field(description="편집된 HTML (data-id 포함)")],
+    output_name: Annotated[Optional[str], Field(description="저장할 HWPX 파일명")] = "",
+) -> dict:
+    """편집된 HTML을 HWPX로 반영하고 스토리지 URL로 반환한다."""
+    if not hwpx_url:
+        raise ValueError("hwpx_url is required")
+    if not edited_html:
+        raise ValueError("edited_html is required")
+
+    template_name = _safe_filename_from_url(hwpx_url)
+    base_name = _build_edit_basename(output_name or template_name)
+    output_hwpx_name = f"{base_name}.hwpx"
+    output_html_name = f"{base_name}.html"
+    edited_html_name = f"{base_name}_edited.html"
+    logger.info("save_hwpx_from_html start: template=%s output=%s", template_name, output_hwpx_name)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_dir_path = Path(tmp_dir)
+        template_path = tmp_dir_path / template_name
+        output_path = tmp_dir_path / output_hwpx_name
+        html_output_path = tmp_dir_path / output_html_name
+        edited_html_path = tmp_dir_path / edited_html_name
+
+        response = requests.get(hwpx_url, timeout=60)
+        response.raise_for_status()
+        template_path.write_bytes(response.content)
+
+        edited_html_path.write_text(edited_html, encoding="utf-8")
+        apply_html_edits_to_hwpx(str(template_path), str(output_path), edited_html)
+
+        DEBUG_OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(output_path, DEBUG_OUTPUT_PATH / output_hwpx_name)
+        shutil.copyfile(edited_html_path, DEBUG_OUTPUT_PATH / edited_html_name)
+
+        file_url = _upload_hwpx_to_storage(output_path, output_hwpx_name)
+        html_url = ""
+        try:
+            hwpx_to_html(output_path, html_output_path, use_lineseg=False, inject_ids=True)
+            shutil.copyfile(html_output_path, DEBUG_OUTPUT_PATH / output_html_name)
+            html_url = _upload_html_to_storage(html_output_path, output_html_name)
+        except Exception as e:
+            logger.warning("HTML 재변환 실패 (HWPX만 반환): %s", e)
+            html_url = ""
+
+    logger.info("save_hwpx_from_html done: output=%s url=%s", output_hwpx_name, file_url)
+    return {
+        "file_name": output_hwpx_name,
         "content_type": HWPX_CONTENT_TYPE,
         "file_url": file_url,
         "html_name": output_html_name if html_url else "",
