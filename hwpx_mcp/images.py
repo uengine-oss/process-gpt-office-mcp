@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Dict, List
 from xml.etree import ElementTree as ET
 
+from .config import GEMINI_IMAGE_TIMEOUT_SECONDS
 
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff"}
 _GOV_STYLE_GUIDE = (
@@ -460,17 +461,32 @@ def apply_image_markers_to_section(
 
     if tasks:
         logger.info("[이미지] Gemini 병렬 생성 시작 %d건 (max=3)", len(tasks))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+        try:
             future_map = {
                 executor.submit(generate_image_gemini_bytes, prompt, ratio=ratio): idx
                 for idx, prompt, ratio in tasks
             }
-            for future in concurrent.futures.as_completed(future_map):
+            done, not_done = concurrent.futures.wait(
+                future_map.keys(),
+                timeout=GEMINI_IMAGE_TIMEOUT_SECONDS,
+            )
+            for future in done:
                 idx = future_map[future]
                 try:
                     image_bytes_by_index[idx] = future.result()
                 except Exception as exc:
                     logger.warning("[이미지] 생성 예외 — idx=%d (%s)", idx, exc)
+            if not_done:
+                logger.warning(
+                    "[이미지] 생성 타임아웃 — 미완료 %d건 (%.0fs)",
+                    len(not_done),
+                    GEMINI_IMAGE_TIMEOUT_SECONDS,
+                )
+                for future in not_done:
+                    future.cancel()
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     for idx, item in enumerate(image_inserts):
         node = item.get("node")

@@ -6,11 +6,11 @@ from typing import Any
 
 from openai import OpenAI
 
-from ..config import MODEL_NAME, OPENAI_API_KEY
+from ..config import MODEL_NAME, OPENAI_API_KEY, OPENAI_TIMEOUT_SECONDS
 from ..models import TextNode, TableSummary
 
 
-_client = OpenAI(api_key=OPENAI_API_KEY)
+_client = OpenAI(api_key=OPENAI_API_KEY, timeout=OPENAI_TIMEOUT_SECONDS)
 logger = logging.getLogger("process-gpt-office-mcp")
 
 
@@ -63,6 +63,26 @@ def _call_llm_json(prompt_sys: str, prompt_user: str, temperature: float = 0.2) 
     data["_elapsed_s"] = round(elapsed, 3)
     logger.info("[LLM RESPONSE] elapsed=%.2fs\n%s", elapsed, json.dumps(data, ensure_ascii=False, indent=2))
     return data
+
+
+def _call_llm_text(prompt_sys: str, prompt_user: str, temperature: float = 0.2) -> str:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is missing")
+
+    started = time.perf_counter()
+    logger.info("[LLM REQUEST] temp=%.2f\n[SYSTEM]\n%s\n[USER]\n%s", temperature, prompt_sys, prompt_user)
+    resp = _client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": prompt_sys},
+            {"role": "user", "content": prompt_user},
+        ],
+        temperature=temperature,
+    )
+    elapsed = time.perf_counter() - started
+    content = resp.choices[0].message.content or ""
+    logger.info("[LLM RESPONSE] elapsed=%.2fs\n%s", elapsed, content[:2000])
+    return content
 
 
 def _filter_llm_nodes(nodes: list[TextNode]) -> list[TextNode]:

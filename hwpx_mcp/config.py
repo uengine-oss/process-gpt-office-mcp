@@ -21,10 +21,29 @@ def _load_env_file() -> None:
 _load_env_file()
 
 
+def _get_bool_env(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "y", "on")
+
+
+def _get_float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 
 MODEL_NAME = "gpt-5.1"
 GEMINI_IMAGE_MODEL = "gemini-3.1-flash-image-preview"
+OPENAI_TIMEOUT_SECONDS = _get_float_env("OPENAI_TIMEOUT_SECONDS", 300.0)
+GEMINI_IMAGE_TIMEOUT_SECONDS = _get_float_env("GEMINI_IMAGE_TIMEOUT_SECONDS", 120.0)
 
 MAX_CONCURRENT_LLM = 4
 SMALL_CELL_HEIGHT_MM = 3
@@ -33,6 +52,6 @@ IMAGE_MIN_WIDTH_MM = 80
 IMAGE_MIN_HEIGHT_MM = 25
 
 LOG_PATH = "./run.log"
-IMAGE_GENERATION_ENABLED = False
+IMAGE_GENERATION_ENABLED = _get_bool_env("IMAGE_GENERATION_ENABLED", False)
 DEBUG_OUTPUT_ENABLED = False
 DEBUG_OUTPUT_DIR = "debug_outputs"

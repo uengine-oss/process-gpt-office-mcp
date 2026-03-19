@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import re
@@ -8,6 +9,7 @@ import uuid
 from pathlib import Path
 from typing import Annotated, Optional
 from urllib.parse import quote, urlparse
+from html import unescape
 
 import requests
 from fastmcp import FastMCP
@@ -18,6 +20,9 @@ from .config import DEBUG_OUTPUT_DIR, DEBUG_OUTPUT_ENABLED, LOG_PATH
 from .runner import process_hwpx_file
 from .hwpx_to_html import hwpx_to_html
 from .hwpx_edit import apply_html_edits_to_hwpx
+from .core.html_pages import extract_pages, extract_first_page
+from .core.html_edit import extract_fills_and_ids
+from .agent.agent import _call_llm_text, _call_llm_json
 
 
 def _setup_logging() -> logging.Logger:
@@ -29,6 +34,7 @@ def _setup_logging() -> logging.Logger:
     logger = logging.getLogger("process-gpt-office-mcp")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
+    logger.propagate = False
 
     fmt = logging.Formatter(
         "%(asctime)s %(levelname)s process-gpt-office-mcp - %(message)s"
@@ -93,6 +99,88 @@ def _build_edit_basename(filename: str) -> str:
     safe = _safe_storage_name(filename or "output.hwpx").replace(".hwpx", "")
     stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     return f"edited-{safe}_{stamp}"
+
+
+def _build_page_edit_prompt(original_page_html: str, instruction: str) -> tuple[str, str]:
+    prompt_sys = (
+        "당신은 HWPX 문서를 편집하는 전문가입니다. "
+        "아래 HTML은 단일 페이지를 나타내며 data-id를 포함합니다. "
+        "구조와 data-id를 유지하고 텍스트만 수정하세요. "
+        "페이지 외부 내용은 절대 변경하지 마세요."
+    )
+    prompt_user = f"""## 사용자 지시
+{instruction}
+
+## 페이지 HTML (수정 대상)
+{original_page_html}
+
+## 출력 규칙
+1) 반드시 단일 <div class="page"> ... </div> 형태로만 출력
+2) data-id 속성을 삭제/변경하지 말 것
+3) 표 구조/셀 구조 유지, 텍스트만 수정
+4) 마크다운 코드블록 금지, 순수 HTML만 출력
+"""
+    return prompt_sys, prompt_user
+
+
+def _build_page_edit_patch_prompt(
+    original_page_html: str,
+    instruction: str,
+) -> tuple[str, str]:
+    prompt_sys = (
+        "당신은 HWPX 문서를 편집하는 전문가입니다. "
+        "아래 HTML은 단일 페이지를 나타내며 data-id를 포함합니다. "
+        "구조와 data-id를 유지하고 텍스트만 수정하세요. "
+        "페이지 외부 내용은 절대 변경하지 마세요."
+    )
+    prompt_user = f"""## 사용자 지시
+{instruction}
+
+## 페이지 HTML (수정 대상)
+{original_page_html}
+
+## 출력(JSON)
+{{"edits":[{{"label":"1) 활용 오픈소스 AI(모델)명","new_text":"..."}}]}}
+
+규칙:
+1) data-id가 있는 요소만 수정 대상
+2) id는 숫자만 사용
+3) new_text는 순수 텍스트만 허용 (HTML 태그 금지)
+4) 항목명(라벨) 셀은 수정 금지, 값/내용 셀만 수정
+5) 가능하면 id 대신 label(라벨 텍스트)을 사용해 지정할 것
+6) label은 페이지 내 실제 항목명 텍스트와 일치해야 함
+7) HTML을 다시 생성하지 말고 edits만 반환
+8) 사용자 지시에 id=숫자 형태가 포함되면 반드시 해당 id를 사용
+"""
+    return prompt_sys, prompt_user
+
+
+def _extract_td_rows(page_html: str) -> list[list[int]]:
+    rows: list[list[int]] = []
+    for row_match in re.finditer(r"<tr[^>]*>(.*?)</tr>", page_html, re.DOTALL):
+        row_html = row_match.group(1)
+        ids: list[int] = []
+        for match in re.finditer(r"<td[^>]*\bdata-id=\"(\d+)\"", row_html):
+            try:
+                ids.append(int(match.group(1)))
+            except (TypeError, ValueError):
+                continue
+        if ids:
+            rows.append(ids)
+    return rows
+
+
+def _normalize_label_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def _normalize_patch_text(value: str) -> str:
+    text = value or ""
+    if "<" in text and ">" in text:
+        text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+        text = re.sub(r"<[^>]+>", "", text)
+    text = unescape(text)
+    return text.replace("\xa0", " ").strip()
 
 
 def _extract_public_url(response: object) -> Optional[str]:
@@ -282,3 +370,111 @@ async def save_hwpx_from_html(
         "html_content_type": HTML_CONTENT_TYPE if html_url else "",
         "html_url": html_url,
     }
+
+
+@mcp.tool
+async def edit_hwpx_page_html(
+    hwpx_url: Annotated[str, Field(description="원본 HWPX URL")],
+    page_number: Annotated[int, Field(description="수정할 페이지 번호 (1부터 시작, 필수)")],
+    instruction: Annotated[str, Field(description="수정 지시사항 (페이지 내부에서 무엇을 어떻게 바꿀지 명시)")],
+    include_original: Annotated[Optional[bool], Field(description="응답에 원본 페이지 HTML 포함 여부")] = False,
+) -> dict:
+    """지정한 페이지를 지시사항대로 수정해 edits를 반환한다.
+
+    요구 사항:
+    - page_number와 instruction이 모두 필요
+    - 지시사항에는 '어떤 내용을 어떻게 수정할지'를 구체적으로 포함
+
+    입력 예시:
+    - page_number: 2
+    - instruction: "2페이지의 과제추진 필요성 문단에 기대효과를 1문단 추가"
+    - instruction: "3페이지 표에서 '담당부서' 값을 'AI전략팀'으로 변경"
+    """
+    if not hwpx_url:
+        raise ValueError("hwpx_url is required")
+    if not page_number or page_number < 1:
+        raise ValueError("page_number must be >= 1")
+    if not instruction:
+        raise ValueError("instruction is required")
+
+    template_name = _safe_filename_from_url(hwpx_url)
+    logger.info("edit_hwpx_page_html start: template=%s page=%d", template_name, page_number)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_dir_path = Path(tmp_dir)
+        template_path = tmp_dir_path / template_name
+        html_output_path = tmp_dir_path / f"page-edit-{template_name}.html"
+
+        response = requests.get(hwpx_url, timeout=60)
+        response.raise_for_status()
+        template_path.write_bytes(response.content)
+
+        hwpx_to_html(template_path, html_output_path, use_lineseg=False, inject_ids=True)
+        html_text = html_output_path.read_text(encoding="utf-8")
+        pages = extract_pages(html_text)
+        if not pages:
+            raise ValueError("페이지를 추출할 수 없습니다.")
+        if page_number > len(pages):
+            raise ValueError(f"page_number 범위 초과: 최대 {len(pages)}")
+        original_page = pages[page_number - 1]
+
+    prompt_sys, prompt_user = _build_page_edit_patch_prompt(original_page, instruction)
+    edits_result = await asyncio.to_thread(_call_llm_json, prompt_sys, prompt_user, 0.2)
+    if not isinstance(edits_result, dict):
+        raise ValueError("LLM 결과가 올바르지 않습니다.")
+    edits = edits_result.get("edits", [])
+    if not isinstance(edits, list):
+        edits = []
+
+    _orig_fills, orig_ids = extract_fills_and_ids(original_page)
+    orig_fills = _orig_fills or {}
+    td_rows = _extract_td_rows(original_page)
+    label_to_value_id: dict[str, int] = {}
+    label_id_to_value_id: dict[int, int] = {}
+    for row in td_rows:
+        for idx, td_id in enumerate(row):
+            next_idx = idx + 1
+            if next_idx >= len(row):
+                continue
+            label_text = _normalize_label_text(str(orig_fills.get(td_id, "")))
+            if not label_text:
+                continue
+            value_id = row[next_idx]
+            label_to_value_id[label_text] = value_id
+            label_id_to_value_id[td_id] = value_id
+    normalized_edits = []
+    for item in edits:
+        if not isinstance(item, dict):
+            continue
+        raw_id = item.get("id")
+        raw_label = item.get("label")
+        new_text = item.get("new_text")
+        if new_text is None:
+            continue
+        target_id: Optional[int] = None
+        if raw_label:
+            label_key = _normalize_label_text(str(raw_label))
+            if label_key in label_to_value_id:
+                target_id = label_to_value_id[label_key]
+        if target_id is None and raw_id is not None:
+            try:
+                numeric_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if orig_ids and numeric_id not in orig_ids:
+                continue
+            target_id = label_id_to_value_id.get(numeric_id, numeric_id)
+        if target_id is None:
+            continue
+        normalized_edits.append(
+            {"id": target_id, "new_text": _normalize_patch_text(str(new_text))}
+        )
+
+    logger.info("edit_hwpx_page_html done: page=%d", page_number)
+    payload = {
+        "page_number": page_number,
+        "edits": normalized_edits,
+    }
+    if include_original:
+        payload["original_page_html"] = original_page
+    return payload
