@@ -716,3 +716,124 @@ def generate_image_gemini_bytes(prompt: str, ratio: str | None = None) -> bytes 
             return base64.b64decode(data)
         return data
     return None
+
+
+def edit_image_gemini_bytes(
+    image_bytes: bytes,
+    instruction: str,
+    mime_type: str = "image/png",
+    selection: dict | None = None,
+    annotated_image_bytes: bytes | None = None,
+    annotated_mime_type: str = "image/png",
+    reference_image_bytes: bytes | None = None,
+    reference_image_mime_type: str = "image/png",
+) -> bytes | None:
+    """기존 이미지 + 수정 지시를 Gemini에 보내 수정된 이미지를 반환한다.
+
+    selection이 있으면 영역 좌표를 프롬프트에 포함하고,
+    annotated_image_bytes가 있으면 오버레이 이미지를 참조용으로 첨부하고,
+    reference_image_bytes가 있으면 삽입/참조할 이미지로 첨부한다.
+    """
+    client = _get_client()
+    if client is None:
+        return None
+    model = _get_image_model()
+
+    from google.genai import types
+
+    # 프롬프트 빌드
+    prompt_lines = [instruction.strip()]
+    if selection:
+        x1, y1 = selection.get("x1", 0), selection.get("y1", 0)
+        x2, y2 = selection.get("x2", 0), selection.get("y2", 0)
+        sw, sh = selection.get("width", 0), selection.get("height", 0)
+        rw, rh = max(0, x2 - x1), max(0, y2 - y1)
+        cx, cy = x1 + rw / 2, y1 + rh / 2
+        prompt_lines.extend([
+            "",
+            f"Image size (px): {sw}x{sh}",
+            f"Region (px): ({x1},{y1}) to ({x2},{y2})",
+            f"Region size (px): {rw}x{rh}",
+            f"Region center (px): ({cx:.1f},{cy:.1f})",
+            "Constraints:",
+            "- Modify only pixels inside the region.",
+            "- Preserve content, colors, and lighting outside the region.",
+            "- Keep edges clean; avoid artifacts or seams at the boundary.",
+        ])
+    if reference_image_bytes:
+        prompt_lines.append(
+            "Instruction: Add the object from the reference image into the specified region. "
+            "Match lighting and perspective to blend naturally."
+        )
+    final_prompt = "\n".join(prompt_lines)
+
+    # 콘텐츠 파츠 빌드
+    contents = []
+    if annotated_image_bytes:
+        contents.append(
+            "[REGION MAP — INPUT ONLY, NEVER REPRODUCE]\n"
+            "The following image shows a dashed blue rectangle on the original. "
+            "Its ONLY purpose is to show you the exact edit region. "
+            "DO NOT copy, trace, or include the dashed border in your output. "
+            "Your output must contain ZERO overlay artifacts."
+        )
+        contents.append(types.Part.from_bytes(data=annotated_image_bytes, mime_type=annotated_mime_type))
+        contents.append(
+            "[SOURCE IMAGE — EDIT THIS ONE]\n"
+            "This is the clean original without any overlay. "
+            "Base your output ENTIRELY on this image. "
+            "Apply edits only inside the region indicated by the map above. "
+            "The output must look like this image with edits applied — no dashed lines, no borders, no masks."
+        )
+    contents.append(types.Part.from_bytes(data=image_bytes, mime_type=mime_type))
+    contents.append(final_prompt)
+    if reference_image_bytes:
+        contents.append(
+            "[REFERENCE OBJECT]\n"
+            "Insert the object/content from this image into the specified region of the source image. "
+            "Match lighting, perspective, and color tone to blend seamlessly. "
+            "Do NOT include any border or overlay from the region map."
+        )
+        contents.append(types.Part.from_bytes(data=reference_image_bytes, mime_type=reference_image_mime_type))
+
+    attempts = [
+        {"response_modalities": ["IMAGE"], "image_config": {"aspect_ratio": "16:9", "image_size": "2K"}},
+        {"response_modalities": ["TEXT", "IMAGE"], "image_config": {"aspect_ratio": "16:9"}},
+        None,
+    ]
+
+    response = None
+    for cfg in attempts:
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=cfg,
+            )
+            break
+        except Exception as exc:
+            logger.warning("[이미지편집] Gemini 편집 실패 cfg=%s: %s", cfg, exc)
+            continue
+
+    if response is None:
+        return None
+
+    parts = getattr(response, "parts", None)
+    if not parts:
+        candidates = getattr(response, "candidates", []) or []
+        if candidates and getattr(candidates[0], "content", None):
+            parts = candidates[0].content.parts
+    if not parts:
+        return None
+
+    for part in parts:
+        inline_data = getattr(part, "inline_data", None)
+        if not inline_data:
+            continue
+        data = getattr(inline_data, "data", None)
+        if not data:
+            continue
+        if isinstance(data, str):
+            return base64.b64decode(data)
+        return data
+    return None

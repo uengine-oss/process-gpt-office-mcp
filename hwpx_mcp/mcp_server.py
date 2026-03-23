@@ -23,6 +23,30 @@ from .hwpx_edit import apply_html_edits_to_hwpx
 from .core.html_pages import extract_pages, extract_first_page
 from .core.html_edit import extract_fills_and_ids
 from .agent.agent import _call_llm_text, _call_llm_json
+from .formats.docx.template import (
+    extract_template_schema,
+    apply_schema_output,
+    load_template_schema_from_url,
+    upload_docx_to_storage,
+    _download_docx,
+)
+from .formats.docx.generation import build_docx_output_from_schema
+from .formats.docx.docx_to_html import docx_to_html as _docx_to_html
+from .formats.docx.docx_edit import apply_html_edits_to_docx as _apply_html_edits_to_docx
+from .formats.slides.generation import (
+    build_slide_markdown,
+    build_slide_markdown_from_research,
+    parse_slides,
+    build_style_guide,
+    generate_slide_images,
+)
+
+
+class _SuppressLlmFilter(logging.Filter):
+    """stream handler에서 LLM 요청/응답 로그를 숨긴다. 파일에는 그대로 기록."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return "[LLM REQUEST]" not in msg and "[LLM RESPONSE]" not in msg
 
 
 def _setup_logging() -> logging.Logger:
@@ -43,6 +67,7 @@ def _setup_logging() -> logging.Logger:
     file_handler.setFormatter(fmt)
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(fmt)
+    stream_handler.addFilter(_SuppressLlmFilter())
     logger.addHandler(file_handler)
     logger.addHandler(stream_handler)
     return logger
@@ -415,7 +440,11 @@ async def edit_hwpx_page_html(
         if not pages:
             raise ValueError("페이지를 추출할 수 없습니다.")
         if page_number > len(pages):
-            raise ValueError(f"page_number 범위 초과: 최대 {len(pages)}")
+            raise ValueError(
+                f"page_number 범위 초과: 이 문서는 총 {len(pages)}페이지입니다. "
+                f"page_number는 물리적 페이지 번호(1~{len(pages)})를 사용하세요. "
+                f"문서 섹션 번호(예: 4.1)와 다릅니다."
+            )
         original_page = pages[page_number - 1]
 
     prompt_sys, prompt_user = _build_page_edit_patch_prompt(original_page, instruction)
@@ -478,3 +507,320 @@ async def edit_hwpx_page_html(
     if include_original:
         payload["original_page_html"] = original_page
     return payload
+
+
+@mcp.tool
+async def generate_docx(
+    template_url: Annotated[str, Field(description="DOCX 템플릿 URL")],
+    query: Annotated[str, Field(description="사용자 요청 / 리서치 주제")],
+    sources_json: Annotated[Optional[str], Field(description="소스 목록 (JSON 직렬화된 list[dict])")] = "",
+    outline_json: Annotated[Optional[str], Field(description="개요 목록 (JSON 직렬화된 list[str])")] = "",
+    user_info_json: Annotated[Optional[str], Field(description="작성자 정보 (JSON 직렬화된 list[dict])")] = "",
+    image_hints_json: Annotated[Optional[str], Field(description="이미지 힌트 (JSON 직렬화된 list[dict])")] = "",
+    output_name: Annotated[Optional[str], Field(description="저장할 파일명 (확장자 포함)")] = "",
+    report_id: Annotated[Optional[str], Field(description="스토리지 경로용 리포트 ID")] = "",
+) -> dict:
+    """DOCX 템플릿을 LLM으로 채워 스토리지 URL로 반환한다."""
+    if not template_url:
+        raise ValueError("template_url is required")
+    if not query:
+        raise ValueError("query is required")
+
+    import json as _json
+    import uuid as _uuid
+    from datetime import datetime as _dt
+
+    sources = _json.loads(sources_json) if sources_json else []
+    outline = _json.loads(outline_json) if outline_json else []
+    user_info = _json.loads(user_info_json) if user_info_json else []
+    image_hints = _json.loads(image_hints_json) if image_hints_json else []
+    rid = report_id or _uuid.uuid4().hex
+    stamp = _dt.utcnow().strftime("%Y%m%d_%H%M%S")
+    safe_output = output_name or f"report-{stamp}.docx"
+    if not safe_output.lower().endswith(".docx"):
+        safe_output += ".docx"
+    # Supabase storage rejects non-ASCII keys — use ASCII-safe storage key
+    import re as _re, unicodedata as _ud
+    _ascii_key = _ud.normalize("NFKD", safe_output).encode("ascii", "ignore").decode("ascii")
+    _ascii_key = _re.sub(r"[^\w.\-]", "_", _ascii_key).strip("_") or f"report-{stamp}.docx"
+    if not _ascii_key.lower().endswith(".docx"):
+        _ascii_key += ".docx"
+    storage_path = f"deep-research/{rid}/{_ascii_key}"
+
+    logger.info("generate_docx start: template=%s output=%s", template_url, safe_output)
+
+    from docx import Document as _Document
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_dir_path = Path(tmp_dir)
+        template_path = _download_docx(template_url)
+        doc = _Document(str(template_path))
+        schema = extract_template_schema(doc)
+
+        schema_output = await build_docx_output_from_schema(
+            query=query,
+            outline=outline,
+            sources=sources,
+            schema=schema,
+            user_info=user_info or None,
+            image_hints=image_hints or None,
+        )
+
+        apply_schema_output(doc, schema, schema_output, report_id=rid)
+
+        output_path = tmp_dir_path / safe_output
+        doc.save(str(output_path))
+        file_url = upload_docx_to_storage(output_path, storage_path)
+
+        html_url = ""
+        html_name = ""
+        try:
+            html_output_name = safe_output.replace(".docx", ".html")
+            html_output_path = tmp_dir_path / html_output_name
+            _docx_to_html(output_path, html_output_path, inject_ids=True)
+            html_url = _upload_html_to_storage(html_output_path, html_output_name)
+            html_name = html_output_name
+        except Exception as e:
+            logger.warning("DOCX HTML 변환 실패: %s", e)
+
+    if not file_url:
+        raise RuntimeError("DOCX 업로드 실패")
+
+    logger.info("generate_docx done: output=%s url=%s html_url=%s", safe_output, file_url, html_url)
+    return {
+        "file_name": safe_output,
+        "content_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "file_url": file_url,
+        "html_url": html_url,
+        "html_name": html_name,
+        "report_id": rid,
+    }
+
+
+@mcp.tool
+async def edit_docx_page_html(
+    docx_url: Annotated[str, Field(description="원본 DOCX URL")],
+    page_number: Annotated[int, Field(description="수정할 물리적 페이지 번호 (1부터 시작). 문서 섹션 번호(예: 4.1)가 아닌 실제 페이지 순서. 모르면 1부터 시도")],
+    instruction: Annotated[str, Field(description="수정 지시사항")],
+    include_original: Annotated[Optional[bool], Field(description="응답에 원본 페이지 HTML 포함 여부")] = False,
+) -> dict:
+    """DOCX의 지정한 페이지를 지시사항대로 수정해 edits를 반환한다.
+
+    주의: page_number는 물리적 페이지 번호(1, 2, 3...)이며, 문서 내 섹션/항목 번호(예: 4.1, 3.2)와 다르다.
+    사용자가 '4.1절', '3번 항목' 등을 언급하면 해당 내용이 몇 페이지에 있는지 파악하여 올바른 page_number를 사용해야 한다.
+
+    요구 사항:
+    - page_number와 instruction이 모두 필요
+    - 지시사항에는 '어떤 내용을 어떻게 수정할지'를 구체적으로 포함
+
+    입력 예시:
+    - page_number: 1
+    - instruction: "표에서 '담당부서' 값을 'AI전략팀'으로 변경"
+    """
+    if not docx_url:
+        raise ValueError("docx_url is required")
+    if not page_number or page_number < 1:
+        raise ValueError("page_number must be >= 1")
+    if not instruction:
+        raise ValueError("instruction is required")
+
+    template_name = Path(urlparse(docx_url).path).name or "template.docx"
+    logger.info("edit_docx_page_html start: template=%s page=%d", template_name, page_number)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_dir_path = Path(tmp_dir)
+        template_path = tmp_dir_path / template_name
+        html_output_path = tmp_dir_path / f"page-edit-{template_name}.html"
+
+        response = requests.get(docx_url, timeout=60)
+        response.raise_for_status()
+        template_path.write_bytes(response.content)
+
+        _docx_to_html(template_path, html_output_path, inject_ids=True)
+        html_text = html_output_path.read_text(encoding="utf-8")
+        pages = extract_pages(html_text)
+        if not pages:
+            raise ValueError("페이지를 추출할 수 없습니다.")
+        if page_number > len(pages):
+            raise ValueError(
+                f"page_number 범위 초과: 이 문서는 총 {len(pages)}페이지입니다. "
+                f"page_number는 물리적 페이지 번호(1~{len(pages)})를 사용하세요. "
+                f"문서 섹션 번호(예: 4.1)와 다릅니다."
+            )
+        original_page = pages[page_number - 1]
+
+    prompt_sys, prompt_user = _build_page_edit_patch_prompt(original_page, instruction)
+    edits_result = await asyncio.to_thread(_call_llm_json, prompt_sys, prompt_user, 0.2)
+    if not isinstance(edits_result, dict):
+        raise ValueError("LLM 결과가 올바르지 않습니다.")
+    edits = edits_result.get("edits", [])
+    if not isinstance(edits, list):
+        edits = []
+
+    _orig_fills, orig_ids = extract_fills_and_ids(original_page)
+    orig_fills = _orig_fills or {}
+    td_rows = _extract_td_rows(original_page)
+    label_to_value_id: dict[str, int] = {}
+    label_id_to_value_id: dict[int, int] = {}
+    for row in td_rows:
+        for idx, td_id in enumerate(row):
+            next_idx = idx + 1
+            if next_idx >= len(row):
+                continue
+            label_text = _normalize_label_text(str(orig_fills.get(td_id, "")))
+            if not label_text:
+                continue
+            value_id = row[next_idx]
+            label_to_value_id[label_text] = value_id
+            label_id_to_value_id[td_id] = value_id
+    normalized_edits = []
+    for item in edits:
+        if not isinstance(item, dict):
+            continue
+        raw_id = item.get("id")
+        raw_label = item.get("label")
+        new_text = item.get("new_text")
+        if new_text is None:
+            continue
+        target_id: Optional[int] = None
+        if raw_label:
+            label_key = _normalize_label_text(str(raw_label))
+            if label_key in label_to_value_id:
+                target_id = label_to_value_id[label_key]
+        if target_id is None and raw_id is not None:
+            try:
+                numeric_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if orig_ids and numeric_id not in orig_ids:
+                continue
+            target_id = label_id_to_value_id.get(numeric_id, numeric_id)
+        if target_id is None:
+            continue
+        normalized_edits.append(
+            {"id": target_id, "new_text": _normalize_patch_text(str(new_text))}
+        )
+
+    logger.info("edit_docx_page_html done: page=%d edits=%d", page_number, len(normalized_edits))
+    payload = {
+        "page_number": page_number,
+        "edits": normalized_edits,
+    }
+    if include_original:
+        payload["original_page_html"] = original_page
+    return payload
+
+
+@mcp.tool
+async def save_docx_from_html(
+    docx_url: Annotated[str, Field(description="원본 DOCX URL")],
+    edited_html: Annotated[str, Field(description="편집된 HTML (data-id 포함)")],
+    output_name: Annotated[Optional[str], Field(description="저장할 DOCX 파일명")] = "",
+) -> dict:
+    """편집된 HTML을 DOCX로 반영하고 스토리지 URL로 반환한다."""
+    if not docx_url:
+        raise ValueError("docx_url is required")
+    if not edited_html:
+        raise ValueError("edited_html is required")
+
+    from datetime import datetime as _dt
+    template_name = Path(urlparse(docx_url).path).name or "template.docx"
+    safe = re.sub(r"[^0-9A-Za-z._-]+", "_", (output_name or template_name).replace(".docx", "")).strip("_") or "output"
+    stamp = _dt.utcnow().strftime("%Y%m%d_%H%M%S")
+    base_name = f"edited-{safe}_{stamp}"
+    output_docx_name = f"{base_name}.docx"
+    output_html_name = f"{base_name}.html"
+
+    logger.info("save_docx_from_html start: template=%s output=%s html_len=%d", template_name, output_docx_name, len(edited_html))
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_dir_path = Path(tmp_dir)
+        template_path = tmp_dir_path / template_name
+        output_path = tmp_dir_path / output_docx_name
+        html_output_path = tmp_dir_path / output_html_name
+
+        response = requests.get(docx_url, timeout=60)
+        response.raise_for_status()
+        template_path.write_bytes(response.content)
+
+        await asyncio.to_thread(_apply_html_edits_to_docx, template_path, output_path, edited_html)
+
+        storage_path = f"deep-research/{uuid.uuid4().hex}/{output_docx_name}"
+        file_url = upload_docx_to_storage(output_path, storage_path)
+
+        html_url = ""
+        try:
+            _docx_to_html(output_path, html_output_path, inject_ids=True)
+            html_url = _upload_html_to_storage(html_output_path, output_html_name)
+        except Exception as e:
+            logger.warning("DOCX HTML 재변환 실패: %s", e)
+
+    if not file_url:
+        raise RuntimeError("DOCX 업로드 실패")
+
+    logger.info("save_docx_from_html done: output=%s url=%s html_url=%s", output_docx_name, file_url, html_url)
+    return {
+        "file_name": output_docx_name,
+        "content_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "file_url": file_url,
+        "html_name": output_html_name if html_url else "",
+        "html_content_type": HTML_CONTENT_TYPE if html_url else "",
+        "html_url": html_url,
+    }
+
+
+@mcp.tool
+async def generate_slides(
+    report_markdown: Annotated[Optional[str], Field(description="보고서 마크다운 (이 값이 있으면 markdown 기반으로 슬라이드 생성)")] = "",
+    research_goal: Annotated[Optional[str], Field(description="리서치 목표 (report_markdown 없을 때 사용)")] = "",
+    outline_json: Annotated[Optional[str], Field(description="개요 목록 (JSON list[str], research_goal 모드에서 사용)")] = "",
+    sources_json: Annotated[Optional[str], Field(description="소스 목록 (JSON list[dict], research_goal 모드에서 사용)")] = "",
+    deck_title: Annotated[Optional[str], Field(description="덱 제목")] = "",
+    slide_count: Annotated[Optional[int], Field(description="슬라이드 개수 (0이면 자동)")] = 0,
+    style: Annotated[Optional[str], Field(description="스타일/색감 가이드")] = "",
+    report_id: Annotated[Optional[str], Field(description="이미지 스토리지 경로용 ID")] = "",
+) -> dict:
+    """슬라이드 마크다운과 이미지를 생성해 반환한다."""
+    import asyncio as _asyncio
+    import json as _json
+    import uuid as _uuid
+
+    rid = report_id or _uuid.uuid4().hex
+    sc = int(slide_count) if slide_count else None
+
+    if report_markdown:
+        slide_md_raw = await _asyncio.to_thread(build_slide_markdown, report_markdown, sc, style or None)
+    elif research_goal:
+        outline = _json.loads(outline_json) if outline_json else []
+        sources = _json.loads(sources_json) if sources_json else []
+
+        # outline/sources가 비어있으면 Tavily로 자동 웹 검색
+        if not outline and not sources:
+            from .search import research_for_slides
+            logger.info("generate_slides: 웹 검색 시작 — %s", research_goal)
+            _outline, _sources = await _asyncio.to_thread(research_for_slides, research_goal)
+            outline = _outline or outline
+            sources = _sources or sources
+            logger.info("generate_slides: 웹 검색 완료 — outline=%d, sources=%d", len(outline), len(sources))
+
+        slide_md_raw = await _asyncio.to_thread(
+            build_slide_markdown_from_research,
+            research_goal, outline, sources, deck_title or "", sc, style or None,
+        )
+    else:
+        raise ValueError("report_markdown 또는 research_goal 중 하나는 필수입니다.")
+
+    logger.info("generate_slides: slide_md_raw len=%d report_id=%s", len(slide_md_raw), rid)
+
+    slides_for_style = parse_slides(slide_md_raw)
+    style_guide = await _asyncio.to_thread(build_style_guide, slides_for_style, deck_title or "", style or "")
+    slide_markdown, image_urls = await _asyncio.to_thread(
+        generate_slide_images, slide_md_raw, rid, style_guide, deck_title or "", sc
+    )
+
+    logger.info("generate_slides done: slides=%d images=%d", len(slides_for_style), len(image_urls))
+    return {
+        "slide_markdown": slide_markdown,
+        "image_urls": image_urls,
+        "report_id": rid,
+    }
