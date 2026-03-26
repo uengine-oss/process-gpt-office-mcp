@@ -10,11 +10,53 @@ from .xml_utils import tag, register_namespaces, find_parent
 logger = logging.getLogger("process-gpt-office-mcp")
 
 
+def _bgr_to_rgb(color: str | None) -> str | None:
+    """HWPX는 색상을 BGR 순서로 저장하므로 R과 B를 교환한다."""
+    if not color or not color.startswith("#") or len(color) != 7:
+        return color
+    r = color[1:3]
+    g = color[3:5]
+    b = color[5:7]
+    return f"#{b}{g}{r}"
+
+
 class StyleMaps:
-    def __init__(self, charprs: dict, paraprs: dict, styles: dict) -> None:
+    def __init__(self, charprs: dict, paraprs: dict, styles: dict, border_fills: dict | None = None) -> None:
         self.charprs = charprs
         self.paraprs = paraprs
         self.styles = styles
+        self.border_fills = border_fills or {}
+
+
+def _parse_border_fill(elem: ET.Element) -> dict:
+    """borderFill 요소를 파싱해 각 변의 border type을 반환한다."""
+    info = dict(elem.attrib)
+    _border_tag_map = {
+        "leftBorder": "left", "rightBorder": "right",
+        "topBorder": "top", "bottomBorder": "bottom",
+        # 혹시 단축 태그가 올 경우도 대비
+        "left": "left", "right": "right", "top": "top", "bottom": "bottom",
+    }
+    for child in elem:
+        ct = tag(child)
+        side = _border_tag_map.get(ct)
+        if side:
+            info[side] = child.attrib.get("type", "NONE")
+    return info
+
+
+def is_invisible_cell_border(border_fills: dict, bf_id: str) -> bool:
+    """셀의 좌우 테두리가 모두 NONE이면 레이아웃/장식용 셀로 판정한다.
+
+    좌우 테두리가 없는 셀은 시각적으로 독립된 입력 칸이 아니라
+    표 내부의 여백·장식 용도로 사용된다.
+    """
+    bf = border_fills.get(str(bf_id))
+    if not bf:
+        return False
+    left = (bf.get("left") or "NONE").upper()
+    right = (bf.get("right") or "NONE").upper()
+    return left == "NONE" and right == "NONE"
 
 
 def load_style_maps(header_path: str) -> StyleMaps:
@@ -25,6 +67,7 @@ def load_style_maps(header_path: str) -> StyleMaps:
     charprs: dict[str, dict] = {}
     paraprs: dict[str, dict] = {}
     styles: dict[str, dict] = {}
+    border_fills: dict[str, dict] = {}
 
     for elem in root.iter():
         t = tag(elem)
@@ -40,8 +83,12 @@ def load_style_maps(header_path: str) -> StyleMaps:
             info = _parse_style(elem)
             if info.get("id") is not None:
                 styles[str(info["id"])] = info
+        elif t == "borderFill":
+            info = _parse_border_fill(elem)
+            if info.get("id") is not None:
+                border_fills[str(info["id"])] = info
 
-    return StyleMaps(charprs=charprs, paraprs=paraprs, styles=styles)
+    return StyleMaps(charprs=charprs, paraprs=paraprs, styles=styles, border_fills=border_fills)
 
 
 def resolve_style_for_runs(
@@ -102,6 +149,13 @@ def summarize_style(style_info: dict | None) -> str:
     if align:
         parts.append(f"align={align}")
 
+    # 셀 border 정보 (NONE인 변만 표기)
+    cell_border = style_info.get("cell_border", {})
+    if cell_border:
+        none_sides = [side for side, btype in cell_border.items() if btype == "NONE"]
+        if none_sides:
+            parts.append(f"border-none={'+'.join(none_sides)}")
+
     if not parts:
         return ""
     return "S:" + ",".join(parts)
@@ -158,6 +212,10 @@ def _parse_charpr(elem: ET.Element) -> dict:
             if "id" in k.lower():
                 info["id"] = v
                 break
+
+    # HWPX textColor는 BGR 순서로 저장됨 → RGB로 변환
+    if "textColor" in info:
+        info["textColor"] = _bgr_to_rgb(info["textColor"])
 
     for child in elem:
         ct = tag(child)

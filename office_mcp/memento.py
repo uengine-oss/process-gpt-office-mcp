@@ -1,0 +1,588 @@
+"""Memento RAG 모듈 — process-gpt-memento 서비스에서 내부 지식 자료를 검색한다.
+
+deep-research-custom의 memento.py를 hwpx-mcp 내부에서 독립적으로 사용할 수 있도록 포팅.
+tenant_id만 있으면 memento에서 RAG 소스를 가져올 수 있다.
+"""
+
+import asyncio
+import logging
+import os
+import re
+from typing import Any, Dict, List, Optional
+
+import httpx
+
+from .agent.agent import _call_llm_json
+
+logger = logging.getLogger(__name__)
+
+# memento 동시 요청 제한 (과도한 병렬 요청으로 인한 타임아웃 방지)
+_MEMENTO_SEM = asyncio.Semaphore(5)
+
+
+def _get_memento_url() -> str:
+    return os.getenv("MEMENTO_SERVICE_URL", "http://memento-service:8005")
+
+
+def _get_drive_folder_param() -> Dict[str, str]:
+    folder_id = (os.getenv("MEMENTO_DRIVE_FOLDER_ID", "") or "").strip()
+    return {"drive_folder_id": folder_id} if folder_id else {}
+
+
+# ---------------------------------------------------------------------------
+# 내부 유틸
+# ---------------------------------------------------------------------------
+
+def _docs_to_sources(raw_docs: List[Any]) -> List[Dict[str, Any]]:
+    """memento /retrieve 응답을 소스 포맷으로 변환."""
+    sources: List[Dict[str, Any]] = []
+    for doc in raw_docs:
+        if not isinstance(doc, dict):
+            continue
+        content = (doc.get("page_content") or "").strip()
+        if not content:
+            continue
+        metadata = doc.get("metadata") or {}
+        file_name = metadata.get("file_name") or "내부 문서"
+        folder_name = metadata.get("drive_folder_name") or ""
+        # 제목에 폴더명 포함: "폴더명/파일명" 형태
+        title = f"{folder_name}/{file_name}" if folder_name else file_name
+        sources.append(
+            {
+                "title": title,
+                "url": metadata.get("web_view_link") or "",
+                "content": content,
+                "source": "memento",
+                "_chunk_index": metadata.get("chunk_index"),
+                "_file_name": file_name,
+                "_drive_folder_name": folder_name,
+                "_section_title": metadata.get("section_title") or "",
+            }
+        )
+    return sources
+
+
+# ---------------------------------------------------------------------------
+# memento HTTP 호출
+# ---------------------------------------------------------------------------
+
+async def _broad_search(query: str, tenant_id: str, top_k: int = 15) -> List[Dict[str, Any]]:
+    url = f"{_get_memento_url()}/retrieve"
+    async with _MEMENTO_SEM:
+        async with httpx.AsyncClient(timeout=60) as client:
+            try:
+                response = await client.get(
+                    url,
+                    params={
+                        "query": query,
+                        "tenant_id": tenant_id,
+                        "all_docs": "true",
+                        "top_k": top_k,
+                        **_get_drive_folder_param(),
+                    },
+                )
+                if response.status_code == 422:
+                    logger.warning("memento가 top_k 파라미터를 지원하지 않음 → top_k 없이 재시도")
+                    response = await client.get(
+                        url,
+                        params={
+                            "query": query,
+                            "tenant_id": tenant_id,
+                            "all_docs": "true",
+                            **_get_drive_folder_param(),
+                        },
+                    )
+                response.raise_for_status()
+                data = response.json()
+                return _docs_to_sources(data.get("response") or [])
+            except Exception as exc:
+                logger.warning("memento 브로드 검색 실패: %s", exc)
+                return []
+
+
+async def _list_documents(tenant_id: str) -> List[str]:
+    url = f"{_get_memento_url()}/documents/list"
+    params = {"tenant_id": tenant_id, **_get_drive_folder_param()}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+        files = data.get("files") or []
+        return [str(name) for name in files if name]
+    except Exception as exc:
+        logger.warning("documents/list 호출 실패: %s", exc)
+        return []
+
+
+async def _get_chunks_metadata(tenant_id: str, file_name: str) -> List[Dict[str, Any]]:
+    url = f"{_get_memento_url()}/documents/chunks-metadata"
+    params = {"tenant_id": tenant_id, "file_name": file_name, **_get_drive_folder_param()}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(url, params=params)
+            if response.status_code in (404, 422):
+                logger.warning(
+                    "memento가 /documents/chunks-metadata를 지원하지 않음 (status=%d)",
+                    response.status_code,
+                )
+                return []
+            response.raise_for_status()
+            data = response.json()
+        return data.get("chunks") or []
+    except Exception as exc:
+        logger.warning("chunks-metadata 호출 실패 (%s): %s", file_name, exc)
+        return []
+
+
+async def _retrieve_by_indices(
+    tenant_id: str, file_name: str, chunk_indices: List[int]
+) -> List[Dict[str, Any]]:
+    if not chunk_indices:
+        return []
+    url = f"{_get_memento_url()}/retrieve-by-indices"
+    payload = {
+        "tenant_id": tenant_id,
+        "file_name": file_name,
+        "chunk_indices": chunk_indices,
+        **_get_drive_folder_param(),
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(url, json=payload)
+            if response.status_code in (404, 422):
+                logger.warning(
+                    "memento가 /retrieve-by-indices를 지원하지 않음 (status=%d)",
+                    response.status_code,
+                )
+                return []
+            response.raise_for_status()
+            data = response.json()
+        raw_docs = data.get("response") or []
+        sources: List[Dict[str, Any]] = []
+        for item in raw_docs:
+            if not isinstance(item, dict):
+                continue
+            content = (item.get("page_content") or "").strip()
+            if not content:
+                continue
+            metadata = item.get("metadata") or {}
+            src_file = metadata.get("file_name") or file_name
+            folder_name = metadata.get("drive_folder_name") or ""
+            title = f"{folder_name}/{src_file}" if folder_name else src_file
+            sources.append(
+                {
+                    "title": title,
+                    "url": metadata.get("web_view_link") or "",
+                    "content": content,
+                    "source": "memento",
+                    "_chunk_index": metadata.get("chunk_index"),
+                    "_file_name": src_file,
+                    "_drive_folder_name": folder_name,
+                    "_section_title": metadata.get("section_title") or "",
+                }
+            )
+        return sources
+    except Exception as exc:
+        logger.warning("retrieve-by-indices 실패 (%s): %s", file_name, exc)
+        return []
+
+
+# ---------------------------------------------------------------------------
+# LLM 기반 선택 함수들
+# ---------------------------------------------------------------------------
+
+def _select_documents_with_llm(
+    query: str, file_names: List[str], max_docs: int
+) -> List[str]:
+    if not file_names or max_docs <= 0:
+        return []
+
+    file_list = "\n".join(f"- {name}" for name in file_names)
+    system_prompt = (
+        "당신은 문서 검색 보조 AI입니다. "
+        "사용자의 요청과 관련 있는 문서를 여러 개 선택해 JSON 형식으로 반환합니다."
+    )
+    user_prompt = (
+        f"사용자 요청: {query}\n\n"
+        f"검색된 문서 목록:\n{file_list}\n\n"
+        f"위 문서 중 사용자 요청에 필요한 문서들을 최대 {max_docs}개까지 선택하세요. "
+        "반드시 목록에 있는 문서명을 그대로 JSON으로 반환하세요. "
+        '예: {"selected_files": ["회사소개서.pdf", "프로젝트_수행실적.txt"]}'
+    )
+
+    def _normalize(selected: List[str]) -> List[str]:
+        normalized: List[str] = []
+        for name in selected:
+            name = (name or "").strip()
+            if not name:
+                continue
+            if name in file_names:
+                normalized.append(name)
+                continue
+            for candidate in file_names:
+                if name in candidate or candidate in name:
+                    normalized.append(candidate)
+                    break
+        return list(dict.fromkeys(normalized))
+
+    try:
+        result = _call_llm_json(system_prompt, user_prompt)
+        selected = result.get("selected_files") or []
+        if isinstance(selected, str):
+            selected = [selected]
+        if not isinstance(selected, list):
+            return []
+        cleaned = _normalize([str(s) for s in selected])
+        return cleaned[:max_docs]
+    except Exception as exc:
+        logger.warning("LLM 문서 선택 실패: %s", exc)
+        return []
+
+
+def _select_chunks_with_llm(
+    outline: List[str],
+    chunks_metadata: List[Dict[str, Any]],
+    file_name: str,
+) -> List[int]:
+    if not chunks_metadata:
+        return []
+
+    chunks_summary = "\n".join(
+        f"- index {c['chunk_index']}: {c.get('section_title') or '(제목 없음)'}"
+        for c in chunks_metadata
+        if c.get("chunk_index") is not None
+    )
+
+    system_prompt = (
+        "당신은 문서 검색 보조 AI입니다. "
+        "주어진 보고서 아웃라인(섹션 목록)을 작성하는 데 필요한 문서 청크를 골라야 합니다."
+    )
+    user_prompt = (
+        f"문서명: {file_name}\n\n"
+        f"보고서 아웃라인(섹션):\n"
+        + "\n".join(f"- {s}" for s in outline)
+        + f"\n\n청크 목록:\n{chunks_summary}\n\n"
+        "위 아웃라인의 각 섹션을 작성하는 데 유용한 청크의 index 번호만 JSON 배열로 반환하세요. "
+        '예: {"selected": [0, 3, 7, 12]}'
+    )
+
+    try:
+        result = _call_llm_json(system_prompt, user_prompt)
+        selected = result.get("selected") or []
+        cleaned = [int(i) for i in selected if str(i).isdigit() or isinstance(i, int)]
+        return cleaned[:30]
+    except Exception as exc:
+        logger.warning("LLM 청크 선택 실패: %s", exc)
+        return []
+
+
+def _final_review_chunks_with_llm(
+    query: str,
+    outline: List[str],
+    sources: List[Dict[str, Any]],
+    max_select: int = 10,
+) -> List[Dict[str, Any]]:
+    if not sources:
+        return sources
+
+    max_candidates = max_select * 3
+    limited_sources = sources[:max_candidates]
+    max_prompt_chars = 12000
+
+    chunks_text_parts = []
+    total_len = 0
+    for pos, src in enumerate(limited_sources):
+        section_title = src.get("_section_title") or ""
+        content_preview = (src.get("content") or "")[:300].replace("\n", " ")
+        header = f"[{pos}] {section_title}" if section_title else f"[{pos}]"
+        block = f"{header}\n내용: {content_preview}"
+        total_len += len(block) + 2
+        if total_len > max_prompt_chars:
+            break
+        chunks_text_parts.append(block)
+    chunks_text = "\n\n".join(chunks_text_parts)
+
+    system_prompt = (
+        "당신은 보고서 작성 보조 AI입니다. "
+        "제공된 문서 청크들의 실제 내용을 검토하고, "
+        "보고서 작성에 진짜 필요한 청크만 JSON 형식으로 선택합니다."
+    )
+    user_prompt = (
+        f"사용자 요청: {query}\n\n"
+        f"보고서 아웃라인:\n" + "\n".join(f"- {s}" for s in outline)
+        + f"\n\n아래 {len(chunks_text_parts)}개 청크의 실제 내용을 검토하여 "
+        f"보고서 작성에 실제로 필요한 청크를 최대 {max_select}개만 선택하세요.\n"
+        "제목만 보고 선택한 게 아니라 실제 내용을 읽고 판단하세요.\n\n"
+        f"[청크 목록]\n{chunks_text}\n\n"
+        f"위 청크 번호([0], [1], ...) 중 보고서에 실제로 쓸 것을 최대 {max_select}개만 골라 JSON으로 반환하세요. "
+        '예: {"selected_indices": [0, 2, 5]}'
+    )
+
+    def _extract_selected_positions(result: Any) -> List[int]:
+        if not isinstance(result, dict):
+            return []
+        candidates = (
+            result.get("selected_indices")
+            or result.get("selected")
+            or result.get("indices")
+            or result.get("chunk_indices")
+            or result.get("chunks")
+            or []
+        )
+        if isinstance(candidates, str):
+            candidates = re.findall(r"\d+", candidates)
+        if not isinstance(candidates, list):
+            return []
+        return [
+            int(p) for p in candidates
+            if isinstance(p, (int, str)) and str(p).isdigit()
+        ]
+
+    try:
+        result = _call_llm_json(system_prompt, user_prompt)
+        selected_positions = _extract_selected_positions(result)
+        selected_positions = selected_positions[:max_select]
+        if not selected_positions:
+            logger.warning("LLM 최종 검수 결과 빈 리스트 → 상위 %d개로 제한", max_select)
+            return limited_sources[:max_select]
+        filtered = [limited_sources[p] for p in selected_positions if 0 <= p < len(limited_sources)]
+        logger.info("최종 검수 완료: %d → %d 청크", len(sources), len(filtered))
+        return filtered
+    except Exception as exc:
+        logger.warning("LLM 최종 검수 실패 → 상위 %d개로 제한: %s", max_select, exc)
+        return limited_sources[:max_select]
+
+
+# ---------------------------------------------------------------------------
+# 공개 API
+# ---------------------------------------------------------------------------
+
+async def search_memento(query: str, tenant_id: str) -> List[Dict[str, Any]]:
+    """단순 memento 검색 — 유사 청크를 소스 포맷으로 반환."""
+    if not tenant_id:
+        return []
+    return await _broad_search(query, tenant_id)
+
+
+async def search_memento_smart(
+    query: str,
+    outline: List[str],
+    tenant_id: str,
+) -> List[Dict[str, Any]]:
+    """문서-우선 스마트 Memento 검색.
+
+    1. 문서 목록 조회 (실패 시 브로드 검색 폴백)
+    2. LLM이 쿼리 기반으로 문서 선택
+    3. 선택된 문서의 청크 메타데이터 조회
+    4. LLM이 outline 기반으로 chunk_index 선택 (title 기반 1차)
+    5. 선택된 청크 content 수신
+    6. LLM이 content 검토 후 최종 선택 (content 기반 2차)
+    """
+    if not tenant_id:
+        return []
+
+    logger.info("search_memento_smart 시작 (query=%s, tenant_id=%s)", query, tenant_id)
+
+    # Step 1: 문서 목록
+    unique_file_names: List[str] = await _list_documents(tenant_id)
+    broad_sources: List[Dict[str, Any]] = []
+    if not unique_file_names:
+        broad_sources = await _broad_search(query, tenant_id, top_k=15)
+        if not broad_sources:
+            logger.info("memento 브로드 검색 결과 없음")
+            return []
+        unique_file_names = list(
+            dict.fromkeys(s["_file_name"] for s in broad_sources if s.get("_file_name"))
+        )
+        if not unique_file_names:
+            return broad_sources
+        logger.info("문서 후보 목록(브로드): %s", unique_file_names)
+    else:
+        logger.info("문서 후보 목록(전체): %s", unique_file_names)
+
+    # Step 2: LLM으로 문서 선택
+    max_docs = len(unique_file_names)
+    selected_docs: List[str] = await asyncio.to_thread(
+        _select_documents_with_llm, query, unique_file_names, max_docs
+    )
+    if not selected_docs:
+        selected_docs = unique_file_names[:max_docs]
+        logger.info("LLM 문서 선택 실패 → 상위 %d개 후보 사용", len(selected_docs))
+    else:
+        logger.info("LLM 선택 문서: %s", selected_docs)
+
+    # Step 3~5: 청크 선택 및 조회
+    max_total_chunks = 30
+    precise_sources: List[Dict[str, Any]] = []
+
+    for file_name in selected_docs:
+        if len(precise_sources) >= max_total_chunks:
+            break
+        chunks_metadata = await _get_chunks_metadata(tenant_id, file_name)
+        if not chunks_metadata:
+            logger.info("chunks-metadata 없음 (%s) → 건너뜀", file_name)
+            continue
+
+        selected_indices = await asyncio.to_thread(
+            _select_chunks_with_llm, outline, chunks_metadata, file_name
+        )
+        if not selected_indices:
+            continue
+
+        logger.info("LLM 선택 chunk_indices (%s): %s", file_name, selected_indices)
+
+        doc_sources = await _retrieve_by_indices(tenant_id, file_name, selected_indices)
+        if not doc_sources:
+            logger.info("retrieve-by-indices 결과 없음 (%s) → 건너뜀", file_name)
+            continue
+
+        precise_sources.extend(doc_sources)
+
+    if not precise_sources:
+        logger.info("문서별 청크 선택 결과 없음 → 브로드 결과 사용")
+        return broad_sources
+
+    logger.info("1차 선택(title 기반): %d 청크", len(precise_sources))
+
+    # Step 6: content 기반 최종 선택
+    final_sources = await asyncio.to_thread(
+        _final_review_chunks_with_llm, query, outline, precise_sources, max_total_chunks
+    )
+
+    # 내부 전용 키 제거
+    for s in final_sources:
+        s.pop("_chunk_index", None)
+        s.pop("_file_name", None)
+        s.pop("_drive_folder_name", None)
+        s.pop("_section_title", None)
+
+    logger.info("search_memento_smart 완료: 최종 %d 청크", len(final_sources))
+    return final_sources
+
+
+def sources_to_reference_text(sources: List[Dict[str, Any]]) -> str:
+    """소스 목록을 reference_text 문자열로 변환한다.
+
+    generate_hwpx는 structured sources가 아닌 reference_text(str)를 사용하므로
+    memento 소스를 텍스트로 변환해야 한다.
+    """
+    if not sources:
+        return ""
+    parts: List[str] = []
+    for src in sources:
+        title = src.get("title") or "Untitled"
+        content = (src.get("content") or "").strip()
+        if not content:
+            continue
+        parts.append(f"[{title}]\n{content}")
+    return "\n\n---\n\n".join(parts)
+
+
+async def search_memento_images(
+    query: str,
+    tenant_id: str,
+    top_k: int = 5,
+) -> List[Dict[str, Any]]:
+    """memento /retrieve-images 로 캡션 기반 이미지 검색.
+
+    Returns:
+        [{"image_id", "image_url", "caption", "file_name", "metadata"}, ...]
+    """
+    if not tenant_id or not query:
+        return []
+    url = f"{_get_memento_url()}/retrieve-images"
+    async with _MEMENTO_SEM:
+        async with httpx.AsyncClient(timeout=60) as client:
+            try:
+                response = await client.get(
+                    url,
+                    params={
+                        "query": query,
+                        "tenant_id": tenant_id,
+                        "top_k": top_k,
+                        **_get_drive_folder_param(),
+                    },
+                )
+                if response.status_code in (404, 422):
+                    logger.warning(
+                        "memento가 /retrieve-images를 지원하지 않음 (status=%d)",
+                        response.status_code,
+                    )
+                    return []
+                response.raise_for_status()
+                data = response.json()
+                return data.get("images") or []
+            except Exception as exc:
+                logger.warning("memento 이미지 검색 실패: %s", exc)
+                return []
+
+
+async def search_memento_images_multi_query(
+    queries: List[str],
+    tenant_id: str,
+    top_k: int = 5,
+) -> List[Dict[str, Any]]:
+    """여러 쿼리로 memento 이미지를 검색하고 중복 제거해 반환한다."""
+    if not tenant_id or not queries:
+        return []
+
+    logger.info("[이미지RAG] %d개 쿼리로 memento 이미지 검색 시작", len(queries))
+
+    tasks = [search_memento_images(q, tenant_id, top_k=top_k) for q in queries]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    seen_ids: set = set()
+    unique_images: List[Dict[str, Any]] = []
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            logger.warning("[이미지RAG] 쿼리 %d 실패: %s", i, result)
+            continue
+        for img in result:
+            image_id = img.get("image_id") or img.get("image_url") or ""
+            if not image_id or image_id in seen_ids:
+                continue
+            seen_ids.add(image_id)
+            unique_images.append(img)
+
+    logger.info("[이미지RAG] 검색 완료: 총 %d개 (중복제거 후)", len(unique_images))
+    return unique_images
+
+
+async def search_memento_multi_query(
+    queries: List[str],
+    tenant_id: str,
+    top_k: int = 5,
+) -> List[Dict[str, Any]]:
+    """여러 쿼리로 memento를 검색하고 중복 제거해 반환한다.
+
+    각 쿼리별 top_k개를 가져온 뒤 content 기준으로 중복을 제거한다.
+    """
+    if not tenant_id or not queries:
+        return []
+
+    logger.info("[청크RAG] %d개 쿼리로 memento 검색 시작 (top_k=%d)", len(queries), top_k)
+
+    # 모든 쿼리를 병렬로 검색
+    tasks = [_broad_search(q, tenant_id, top_k=top_k) for q in queries]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # 결과 합산 + 중복 제거 (content 해시 기준)
+    seen_contents: set = set()
+    unique_sources: List[Dict[str, Any]] = []
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            logger.warning("[청크RAG] 쿼리 %d 실패: %s", i, result)
+            continue
+        for src in result:
+            content = (src.get("content") or "").strip()
+            if not content:
+                continue
+            content_key = content[:200]  # 앞 200자로 중복 판별
+            if content_key in seen_contents:
+                continue
+            seen_contents.add(content_key)
+            unique_sources.append(src)
+
+    logger.info("[청크RAG] 검색 완료: 총 %d개 (중복제거 후)", len(unique_sources))
+    return unique_sources

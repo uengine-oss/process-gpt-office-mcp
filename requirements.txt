@@ -4,3 +4,5 @@ openai
 google-genai
 supabase
 python-docx
+playwright
+Pillow

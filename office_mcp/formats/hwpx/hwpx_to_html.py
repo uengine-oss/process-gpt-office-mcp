@@ -5,8 +5,8 @@ import zipfile
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
-from .core.parser import collect_runs_and_texts
-from .core.xml_utils import tag as core_tag
+from ...core.parser import collect_runs_and_texts
+from ...core.xml_utils import tag as core_tag
 
 NS = {
     "hp": "http://www.hancom.co.kr/hwpml/2011/paragraph",
@@ -592,8 +592,6 @@ def _render_table(tbl, char_styles, para_styles, border_fills, styles, rows=None
                 break
 
     tbl_border = border_fills.get(tbl.attrib.get("borderFillIDRef"))
-    if not all_cells_borderless:
-        tbl_style.update(_border_css(tbl_border))
     pos = tbl.find("hp:pos", NS)
     if pos is not None and pos.attrib.get("horzAlign") == "CENTER":
         tbl_style["margin-left"] = "auto"
@@ -604,9 +602,11 @@ def _render_table(tbl, char_styles, para_styles, border_fills, styles, rows=None
         pad = _hwpunit_to_px(in_margin.attrib.get("left"))
         table_padding = pad
     spacing = _hwpunit_to_px(tbl.attrib.get("cellSpacing"))
+    use_separate = False
     if spacing and spacing != "0.00px":
         tbl_style["border-collapse"] = "separate"
         tbl_style["border-spacing"] = spacing
+        use_separate = True
     else:
         # If borders have mixed widths/types, avoid collapse to reduce artifacts.
         border_widths = set()
@@ -624,6 +624,11 @@ def _render_table(tbl, char_styles, para_styles, border_fills, styles, rows=None
         if len(border_widths) > 1 or len(border_types) > 1:
             tbl_style["border-collapse"] = "separate"
             tbl_style["border-spacing"] = "0px"
+            use_separate = True
+    # separate 모드에서는 table border를 적용하지 않음 (셀 border만으로 외곽 구성)
+    # 셀에 border:none인 부분에서 table border가 보이는 것을 방지
+    if not all_cells_borderless and not use_separate:
+        tbl_style.update(_border_css(tbl_border))
     scale_y = tbl.attrib.get("_scale_y")
     scaled_height = tbl.attrib.get("_scaled_height_px")
     if scale_y:
@@ -965,7 +970,7 @@ def _section_page_style(section_root):
     return style
 
 
-def hwpx_to_html(hwpx_path: Path, output_path: Path, use_lineseg: bool, inject_ids: bool = False):
+def hwpx_to_html(hwpx_path: Path, output_path: Path, use_lineseg: bool, inject_ids: bool = False, split_pages: bool = True):
     with zipfile.ZipFile(hwpx_path) as zipf:
         char_styles, para_styles, border_fills, styles = _parse_header(zipf)
         section_names = _sorted_section_names(zipf)
@@ -1001,17 +1006,168 @@ def hwpx_to_html(hwpx_path: Path, output_path: Path, use_lineseg: bool, inject_i
                         margin_top_hwp = 0
                         margin_bottom_hwp = 0
             children = list(root)
-            page_children = []
-            prev_first_pos = None
-            prev_last_bottom = None
-            for child in children:
-                tag = child.tag.split("}")[-1]
-                if tag == "tbl":
-                    table_first_pos = _child_first_pos(child)
+
+            if not split_pages:
+                # 원본 양식 모드: vertpos 좌표 + pageBreak + 페이지 높이로 분리
+                # 테이블 row chunk 분리와 스케일링은 하지 않음 (표를 임의로 쪼개지 않음)
+                content_height = None
+                if page_height_hwp:
+                    content_height = page_height_hwp - margin_top_hwp - margin_bottom_hwp
+
+                def _flush_page(pchildren):
+                    if not pchildren:
+                        return
+                    page_block = _render_children(
+                        pchildren, char_styles, para_styles,
+                        border_fills, styles,
+                        use_lineseg=use_lineseg, node_id_map=node_id_map,
+                    )
+                    body_blocks.append(
+                        f"<div class=\"page\" style=\"{_build_style(page_style)}\">"
+                        + "".join(page_block) + "</div>"
+                    )
+
+                page_children = []
+                prev_first_pos = None
+                prev_last_bottom = None
+                for child in children:
+                    tag = child.tag.split("}")[-1]
+                    child_first_pos = _child_first_pos(child)
+                    child_last_bottom = _child_last_bottom(child)
+                    need_break = False
+                    # vertpos가 이전보다 위로 올라가면 새 페이지
                     if (
-                        table_first_pos is not None
+                        child_first_pos is not None
                         and prev_first_pos is not None
-                        and table_first_pos < prev_first_pos - 1000
+                        and child_first_pos < prev_first_pos - 1000
+                    ):
+                        need_break = True
+                    # 다음 요소가 페이지 상단이고 이전 요소가 아래쪽이면 새 페이지
+                    elif (
+                        child_first_pos is not None
+                        and child_first_pos <= 1000
+                        and prev_last_bottom is not None
+                        and prev_last_bottom > 2000
+                    ):
+                        need_break = True
+                    # fpos가 페이지 높이를 넘으면 새 페이지
+                    elif (
+                        content_height
+                        and child_first_pos is not None
+                        and child_first_pos >= content_height
+                    ):
+                        need_break = True
+                    # 이전 요소가 페이지 높이를 넘었으면 다음 요소는 새 페이지
+                    elif (
+                        content_height
+                        and prev_last_bottom is not None
+                        and prev_last_bottom > content_height
+                    ):
+                        need_break = True
+                    # 현재 요소를 추가하면 페이지를 넘기는 경우 새 페이지
+                    elif (
+                        content_height
+                        and child_first_pos is not None
+                        and child_last_bottom is not None
+                        and child_last_bottom - child_first_pos > 1000
+                        and prev_last_bottom is not None
+                        and prev_last_bottom + (child_last_bottom - child_first_pos) > content_height * 1.2
+                    ):
+                        need_break = True
+                    # 명시적 pageBreak
+                    elif tag == "p" and child.attrib.get("pageBreak") == "1":
+                        need_break = True
+                    if need_break:
+                        _flush_page(page_children)
+                        page_children = []
+                        prev_first_pos = None
+                        prev_last_bottom = None
+                    page_children.append(child)
+                    if child_first_pos is not None:
+                        prev_first_pos = child_first_pos
+                    if child_last_bottom is not None:
+                        prev_last_bottom = child_last_bottom
+                _flush_page(page_children)
+            else:
+                # 완성본 모드: 좌표 기반 + 테이블 chunk + pageBreak 분리
+                page_children = []
+                prev_first_pos = None
+                prev_last_bottom = None
+                for child in children:
+                    tag = child.tag.split("}")[-1]
+                    if tag == "tbl":
+                        table_first_pos = _child_first_pos(child)
+                        if (
+                            table_first_pos is not None
+                            and prev_first_pos is not None
+                            and table_first_pos < prev_first_pos - 1000
+                        ):
+                            if page_children:
+                                page_block = _render_children(
+                                    page_children,
+                                    char_styles,
+                                    para_styles,
+                                    border_fills,
+                                    styles,
+                                    use_lineseg=use_lineseg,
+                                    node_id_map=node_id_map,
+                                )
+                                body_blocks.append(
+                                    f"<div class=\"page\" style=\"{_build_style(page_style)}\">"
+                                    + "".join(page_block)
+                                    + "</div>"
+                                )
+                                page_children = []
+                            prev_first_pos = None
+                        max_bottom = _table_max_bottom(child)
+                        if page_height_hwp and max_bottom:
+                            available = page_height_hwp - margin_top_hwp - margin_bottom_hwp
+                            if available > 0 and max_bottom > available:
+                                scale = max(0.5, available / max_bottom)
+                                child.attrib["_scale_y"] = f"{scale:.4f}"
+                                available_px = _hwpunit_to_px(available)
+                                if available_px:
+                                    child.attrib["_scaled_height_px"] = available_px
+                        chunks = _table_row_chunks(child)
+                        if len(chunks) > 1:
+                            if page_children:
+                                page_block = _render_children(
+                                    page_children,
+                                    char_styles,
+                                    para_styles,
+                                    border_fills,
+                                    styles,
+                                    use_lineseg=use_lineseg,
+                                )
+                                body_blocks.append(
+                                    f"<div class=\"page\" style=\"{_build_style(page_style)}\">"
+                                    + "".join(page_block)
+                                    + "</div>"
+                                )
+                                page_children = []
+                            for rows in chunks:
+                                table_html = _render_table(
+                                    child,
+                                    char_styles,
+                                    para_styles,
+                                    border_fills,
+                                    styles,
+                                    rows=rows,
+                                    node_id_map=node_id_map,
+                                )
+                                body_blocks.append(
+                                    f"<div class=\"page\" style=\"{_build_style(page_style)}\">"
+                                    + table_html
+                                    + "</div>"
+                                )
+                            prev_first_pos = None
+                            continue
+                    child_first_pos = _child_first_pos(child)
+                    child_last_bottom = _child_last_bottom(child)
+                    if (
+                        child_first_pos is not None
+                        and prev_first_pos is not None
+                        and child_first_pos < prev_first_pos - 1000
                     ):
                         if page_children:
                             page_block = _render_children(
@@ -1029,18 +1185,12 @@ def hwpx_to_html(hwpx_path: Path, output_path: Path, use_lineseg: bool, inject_i
                                 + "</div>"
                             )
                             page_children = []
-                        prev_first_pos = None
-                    max_bottom = _table_max_bottom(child)
-                    if page_height_hwp and max_bottom:
-                        available = page_height_hwp - margin_top_hwp - margin_bottom_hwp
-                        if available > 0 and max_bottom > available:
-                            scale = max(0.5, available / max_bottom)
-                            child.attrib["_scale_y"] = f"{scale:.4f}"
-                            available_px = _hwpunit_to_px(available)
-                            if available_px:
-                                child.attrib["_scaled_height_px"] = available_px
-                    chunks = _table_row_chunks(child)
-                    if len(chunks) > 1:
+                    if (
+                        child_first_pos is not None
+                        and child_first_pos <= 1000
+                        and prev_last_bottom is not None
+                        and prev_last_bottom > 2000
+                    ):
                         if page_children:
                             page_block = _render_children(
                                 page_children,
@@ -1049,6 +1199,7 @@ def hwpx_to_html(hwpx_path: Path, output_path: Path, use_lineseg: bool, inject_i
                                 border_fills,
                                 styles,
                                 use_lineseg=use_lineseg,
+                                node_id_map=node_id_map,
                             )
                             body_blocks.append(
                                 f"<div class=\"page\" style=\"{_build_style(page_style)}\">"
@@ -1056,106 +1207,44 @@ def hwpx_to_html(hwpx_path: Path, output_path: Path, use_lineseg: bool, inject_i
                                 + "</div>"
                             )
                             page_children = []
-                        for rows in chunks:
-                            table_html = _render_table(
-                                child,
+                    if tag == "p" and child.attrib.get("pageBreak") == "1":
+                        if page_children:
+                            page_block = _render_children(
+                                page_children,
                                 char_styles,
                                 para_styles,
                                 border_fills,
                                 styles,
-                                rows=rows,
+                                use_lineseg=use_lineseg,
                                 node_id_map=node_id_map,
                             )
                             body_blocks.append(
                                 f"<div class=\"page\" style=\"{_build_style(page_style)}\">"
-                                + table_html
+                                + "".join(page_block)
                                 + "</div>"
                             )
-                        prev_first_pos = None
-                        continue
-                child_first_pos = _child_first_pos(child)
-                child_last_bottom = _child_last_bottom(child)
-                if (
-                    child_first_pos is not None
-                    and prev_first_pos is not None
-                    and child_first_pos < prev_first_pos - 1000
-                ):
-                    if page_children:
-                        page_block = _render_children(
-                            page_children,
-                            char_styles,
-                            para_styles,
-                            border_fills,
-                            styles,
-                            use_lineseg=use_lineseg,
-                            node_id_map=node_id_map,
-                        )
-                        body_blocks.append(
-                            f"<div class=\"page\" style=\"{_build_style(page_style)}\">"
-                            + "".join(page_block)
-                            + "</div>"
-                        )
-                        page_children = []
-                if (
-                    child_first_pos is not None
-                    and child_first_pos <= 1000
-                    and prev_last_bottom is not None
-                    and prev_last_bottom > 2000
-                ):
-                    if page_children:
-                        page_block = _render_children(
-                            page_children,
-                            char_styles,
-                            para_styles,
-                            border_fills,
-                            styles,
-                            use_lineseg=use_lineseg,
-                            node_id_map=node_id_map,
-                        )
-                        body_blocks.append(
-                            f"<div class=\"page\" style=\"{_build_style(page_style)}\">"
-                            + "".join(page_block)
-                            + "</div>"
-                        )
-                        page_children = []
-                if tag == "p" and child.attrib.get("pageBreak") == "1":
-                    if page_children:
-                        page_block = _render_children(
-                            page_children,
-                            char_styles,
-                            para_styles,
-                            border_fills,
-                            styles,
-                            use_lineseg=use_lineseg,
-                            node_id_map=node_id_map,
-                        )
-                        body_blocks.append(
-                            f"<div class=\"page\" style=\"{_build_style(page_style)}\">"
-                            + "".join(page_block)
-                            + "</div>"
-                        )
-                        page_children = []
-                page_children.append(child)
-                if child_first_pos is not None:
-                    prev_first_pos = child_first_pos
-                if child_last_bottom is not None:
-                    prev_last_bottom = child_last_bottom
+                            page_children = []
+                    page_children.append(child)
+                    if child_first_pos is not None:
+                        prev_first_pos = child_first_pos
+                    if child_last_bottom is not None:
+                        prev_last_bottom = child_last_bottom
 
-            if page_children:
-                page_block = _render_children(
-                    page_children,
-                    char_styles,
-                    para_styles,
-                    border_fills,
-                    styles,
-                    use_lineseg=use_lineseg,
-                    node_id_map=node_id_map,
-                )
-                body_blocks.append(
-                    f"<div class=\"page\" style=\"{_build_style(page_style)}\">"
-                    + "".join(page_block)
-                    + "</div>"
-                )
+                if page_children:
+                    page_block = _render_children(
+                        page_children,
+                        char_styles,
+                        para_styles,
+                        border_fills,
+                        styles,
+                        use_lineseg=use_lineseg,
+                        node_id_map=node_id_map,
+                    )
+                    body_blocks.append(
+                        f"<div class=\"page\" style=\"{_build_style(page_style)}\">"
+                        + "".join(page_block)
+                        + "</div>"
+                    )
             if inject_ids:
                 global_offset += local_count
 

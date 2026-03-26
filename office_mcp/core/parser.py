@@ -3,7 +3,7 @@ from xml.etree import ElementTree as ET
 
 from ..config import SMALL_CELL_HEIGHT_MM, SMALL_CELL_WIDTH_MM
 from ..models import TextNode, _HWP_UNITS_PER_MM
-from .style_mapper import resolve_style_for_runs, summarize_style, StyleMaps
+from .style_mapper import resolve_style_for_runs, summarize_style, StyleMaps, is_invisible_cell_border
 from .xml_utils import tag, ns, register_namespaces
 
 
@@ -129,6 +129,7 @@ def parse_section(
                 cell_height = 0
                 cell_col_span = 1
                 cell_row_span = 1
+                cell_border_fill_id = None
                 for cc in tc:
                     if tag(cc) == "cellAddr":
                         for k, v in cc.attrib.items():
@@ -157,19 +158,25 @@ def parse_section(
                             cell_row_span = int(cc.attrib.get("rowSpan", cell_row_span))
                         except (TypeError, ValueError):
                             pass
+                    elif tag(cc) == "cellPr":
+                        for k, v in cc.attrib.items():
+                            if "borderFillIDRef" in k:
+                                cell_border_fill_id = str(v)
+                                break
+
+                # 중첩 표가 있는 셀인지 확인
+                nested_tbls = [ch for ch in tc.iter() if tag(ch) == "tbl"]
+                if nested_tbls:
+                    # 중첩 표의 셀들을 같은 table_idx로 파싱 (외부 셀 자체는 건너뜀)
+                    for nested_tbl in nested_tbls:
+                        _process_table(nested_tbl, tbl_idx)
+                    continue
 
                 runs, t_elems = collect_runs_and_texts(tc)
                 raw_text = _get_text(t_elems, strip=False)
                 text = _get_text(t_elems, strip=True)
                 height_mm = round(cell_height / _HWP_UNITS_PER_MM) if cell_height > 0 else 0
                 width_mm = round(cell_width / _HWP_UNITS_PER_MM) if cell_width > 0 else 0
-                is_spacer = (
-                    (not text) and (not raw_text.strip()) and
-                    (
-                        (height_mm > 0 and height_mm <= SMALL_CELL_HEIGHT_MM) or
-                        (width_mm > 0 and width_mm <= SMALL_CELL_WIDTH_MM)
-                    )
-                )
                 run_elems = [r for r, _ in runs]
                 style_refs, style_info = resolve_style_for_runs(run_elems, parent_map, style_maps)
                 style_missing = {}
@@ -180,7 +187,43 @@ def parse_section(
                         style_missing["para"] = style_refs["para_id"]
                     if style_refs.get("char_id") and style_refs["char_id"] not in style_maps.charprs:
                         style_missing["char"] = style_refs["char_id"]
+                # 셀 border 정보를 style_info에 추가
+                if cell_border_fill_id and style_maps and style_maps.border_fills:
+                    bf = style_maps.border_fills.get(str(cell_border_fill_id))
+                    if bf:
+                        edges = bf.get("edges") or {}
+                        border_info = {}
+                        for side in ("left", "right", "top", "bottom"):
+                            edge = edges.get(side, {})
+                            border_info[side] = edge.get("type", "NONE")
+                        if style_info is None:
+                            style_info = {}
+                        style_info["cell_border"] = border_info
+
                 style_summary = summarize_style(style_info)
+
+                # 빈 셀 spacer 판정:
+                # 1) 작은 셀 (높이 ≤3mm 또는 너비 ≤8mm)
+                # 2) 폰트 높이 >50pt (레이아웃 여백용)
+                # 3) 테두리 대부분 NONE인 투명 셀 (장식/레이아웃용)
+                try:
+                    _char_height = int((style_info or {}).get("char", {}).get("height", 0) or 0)
+                except (TypeError, ValueError):
+                    _char_height = 0
+                _invisible_border = (
+                    cell_border_fill_id is not None
+                    and style_maps is not None
+                    and is_invisible_cell_border(style_maps.border_fills, cell_border_fill_id)
+                )
+                is_spacer = (
+                    (not text) and (not raw_text.strip()) and
+                    (
+                        (height_mm > 0 and height_mm <= SMALL_CELL_HEIGHT_MM) or
+                        (width_mm > 0 and width_mm <= SMALL_CELL_WIDTH_MM) or
+                        (_char_height > 5000) or
+                        _invisible_border
+                    )
+                )
 
                 nodes.append(TextNode(
                     nid=nid[0], ntype="table_cell", text=text,
@@ -224,7 +267,18 @@ def parse_section(
             raw_text = _get_text(t_elems, strip=False)
             text = _get_text(t_elems, strip=True)
             depth = _calc_depth(raw_text)
-            skip_fill = (not text) and (not raw_text.strip()) and depth == 0
+            # 빈 본문 spacer 판정:
+            # 폰트 크기가 작은(8pt 미만 = height < 800) 빈 본문은 여백용 spacer
+            # 정상 크기 빈 본문은 내용 채울 자리일 수 있으므로 skip하지 않음
+            _is_empty = (not text) and (not raw_text.strip()) and depth == 0
+            if _is_empty:
+                try:
+                    _font_h = int((style_info or {}).get("char", {}).get("height", 0) or 0)
+                except (TypeError, ValueError):
+                    _font_h = 0
+                skip_fill = _font_h < 800  # 8pt 미만이면 spacer
+            else:
+                skip_fill = False
             nodes.append(TextNode(
                 nid=nid[0], ntype="body_text", text=text,
                 raw_text=raw_text, depth=depth, skip_fill=skip_fill,

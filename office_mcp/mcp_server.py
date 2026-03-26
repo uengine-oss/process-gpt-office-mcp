@@ -17,9 +17,9 @@ from pydantic import Field
 from supabase import create_client
 
 from .config import DEBUG_OUTPUT_DIR, DEBUG_OUTPUT_ENABLED, LOG_PATH
-from .runner import process_hwpx_file
-from .hwpx_to_html import hwpx_to_html
-from .hwpx_edit import apply_html_edits_to_hwpx
+from .formats.hwpx.runner import process_hwpx_file
+from .formats.hwpx.hwpx_to_html import hwpx_to_html
+from .formats.hwpx.hwpx_edit import apply_html_edits_to_hwpx
 from .core.html_pages import extract_pages, extract_first_page
 from .core.html_edit import extract_fills_and_ids
 from .agent.agent import _call_llm_text, _call_llm_json
@@ -279,6 +279,10 @@ async def generate_hwpx(
     report_topic: Annotated[str, Field(description="보고서 주제")],
     report_description: Annotated[Optional[str], Field(description="보고서 상세 설명")] = "",
     reference_text: Annotated[Optional[str], Field(description="참고할 텍스트")] = "",
+    tenant_id: Annotated[Optional[str], Field(description="테넌트 ID (memento RAG 검색용)")] = "",
+    user_jwt: Annotated[Optional[str], Field(description="사용자 JWT (자동 주입)")] = "",
+    user_uid: Annotated[Optional[str], Field(description="사용자 UID (자동 주입)")] = "",
+    user_email: Annotated[Optional[str], Field(description="사용자 이메일 (자동 주입)")] = "",
 ) -> dict:
     """HWPX 템플릿을 채워 스토리지 URL로 반환한다."""
     if not template_url:
@@ -288,6 +292,30 @@ async def generate_hwpx(
 
     report_description = report_description or ""
     reference_text = reference_text or ""
+
+    # tenant_id가 있으면 memento에서 내부 지식 자료를 검색해 reference_text에 추가
+    if (tenant_id or "").strip():
+        try:
+            from .memento import search_memento_smart, sources_to_reference_text
+            logger.info("generate_hwpx: memento RAG 검색 시작 (tenant_id=%s)", tenant_id)
+            memento_sources = await search_memento_smart(
+                query=report_topic,
+                outline=[report_description] if report_description else [report_topic],
+                tenant_id=tenant_id.strip(),
+            )
+            if memento_sources:
+                memento_text = sources_to_reference_text(memento_sources)
+                if reference_text.strip():
+                    reference_text = memento_text + "\n\n---\n\n" + reference_text
+                else:
+                    reference_text = memento_text
+                logger.info("generate_hwpx: memento 소스 %d개 → reference_text에 추가 완료", len(memento_sources))
+            else:
+                logger.info("generate_hwpx: memento 검색 결과 없음")
+        except Exception as exc:
+            logger.warning("generate_hwpx: memento 검색 실패 (무시하고 계속 진행): %s", exc)
+    else:
+        logger.info("generate_hwpx: tenant_id 없음 → memento 검색 건너뜀")
     template_name = _safe_filename_from_url(template_url)
     base_name = _build_output_basename(report_topic)
     output_name = f"{base_name}.hwpx"
@@ -310,6 +338,7 @@ async def generate_hwpx(
             report_topic=report_topic,
             report_description=report_description,
             reference_text=reference_text,
+            tenant_id=(tenant_id or "").strip(),
         )
 
         if DEBUG_OUTPUT_ENABLED:
@@ -344,6 +373,10 @@ async def save_hwpx_from_html(
     hwpx_url: Annotated[str, Field(description="원본 HWPX URL")],
     edited_html: Annotated[str, Field(description="편집된 HTML (data-id 포함)")],
     output_name: Annotated[Optional[str], Field(description="저장할 HWPX 파일명")] = "",
+    tenant_id: Annotated[Optional[str], Field(description="테넌트 ID (자동 주입)")] = "",
+    user_jwt: Annotated[Optional[str], Field(description="사용자 JWT (자동 주입)")] = "",
+    user_uid: Annotated[Optional[str], Field(description="사용자 UID (자동 주입)")] = "",
+    user_email: Annotated[Optional[str], Field(description="사용자 이메일 (자동 주입)")] = "",
 ) -> dict:
     """편집된 HTML을 HWPX로 반영하고 스토리지 URL로 반환한다."""
     if not hwpx_url:
@@ -403,6 +436,10 @@ async def edit_hwpx_page_html(
     page_number: Annotated[int, Field(description="수정할 페이지 번호 (1부터 시작, 필수)")],
     instruction: Annotated[str, Field(description="수정 지시사항 (페이지 내부에서 무엇을 어떻게 바꿀지 명시)")],
     include_original: Annotated[Optional[bool], Field(description="응답에 원본 페이지 HTML 포함 여부")] = False,
+    tenant_id: Annotated[Optional[str], Field(description="테넌트 ID (자동 주입)")] = "",
+    user_jwt: Annotated[Optional[str], Field(description="사용자 JWT (자동 주입)")] = "",
+    user_uid: Annotated[Optional[str], Field(description="사용자 UID (자동 주입)")] = "",
+    user_email: Annotated[Optional[str], Field(description="사용자 이메일 (자동 주입)")] = "",
 ) -> dict:
     """지정한 페이지를 지시사항대로 수정해 edits를 반환한다.
 
@@ -519,6 +556,10 @@ async def generate_docx(
     image_hints_json: Annotated[Optional[str], Field(description="이미지 힌트 (JSON 직렬화된 list[dict])")] = "",
     output_name: Annotated[Optional[str], Field(description="저장할 파일명 (확장자 포함)")] = "",
     report_id: Annotated[Optional[str], Field(description="스토리지 경로용 리포트 ID")] = "",
+    tenant_id: Annotated[Optional[str], Field(description="테넌트 ID (memento RAG 검색용)")] = "",
+    user_jwt: Annotated[Optional[str], Field(description="사용자 JWT (자동 주입)")] = "",
+    user_uid: Annotated[Optional[str], Field(description="사용자 UID (자동 주입)")] = "",
+    user_email: Annotated[Optional[str], Field(description="사용자 이메일 (자동 주입)")] = "",
 ) -> dict:
     """DOCX 템플릿을 LLM으로 채워 스토리지 URL로 반환한다."""
     if not template_url:
@@ -532,6 +573,26 @@ async def generate_docx(
 
     sources = _json.loads(sources_json) if sources_json else []
     outline = _json.loads(outline_json) if outline_json else []
+
+    # tenant_id가 있으면 memento에서 내부 지식 자료를 검색해 sources에 추가
+    if (tenant_id or "").strip():
+        try:
+            from .memento import search_memento_smart
+            logger.info("generate_docx: memento RAG 검색 시작 (tenant_id=%s)", tenant_id)
+            memento_sources = await search_memento_smart(
+                query=query,
+                outline=outline if outline else [query],
+                tenant_id=tenant_id.strip(),
+            )
+            if memento_sources:
+                sources = memento_sources + sources
+                logger.info("generate_docx: memento 소스 %d개 추가 (총 %d개)", len(memento_sources), len(sources))
+            else:
+                logger.info("generate_docx: memento 검색 결과 없음")
+        except Exception as exc:
+            logger.warning("generate_docx: memento 검색 실패 (무시하고 계속 진행): %s", exc)
+    else:
+        logger.info("generate_docx: tenant_id 없음 → memento 검색 건너뜀")
     user_info = _json.loads(user_info_json) if user_info_json else []
     image_hints = _json.loads(image_hints_json) if image_hints_json else []
     rid = report_id or _uuid.uuid4().hex
@@ -603,6 +664,10 @@ async def edit_docx_page_html(
     page_number: Annotated[int, Field(description="수정할 물리적 페이지 번호 (1부터 시작). 문서 섹션 번호(예: 4.1)가 아닌 실제 페이지 순서. 모르면 1부터 시도")],
     instruction: Annotated[str, Field(description="수정 지시사항")],
     include_original: Annotated[Optional[bool], Field(description="응답에 원본 페이지 HTML 포함 여부")] = False,
+    tenant_id: Annotated[Optional[str], Field(description="테넌트 ID (자동 주입)")] = "",
+    user_jwt: Annotated[Optional[str], Field(description="사용자 JWT (자동 주입)")] = "",
+    user_uid: Annotated[Optional[str], Field(description="사용자 UID (자동 주입)")] = "",
+    user_email: Annotated[Optional[str], Field(description="사용자 이메일 (자동 주입)")] = "",
 ) -> dict:
     """DOCX의 지정한 페이지를 지시사항대로 수정해 edits를 반환한다.
 
@@ -716,6 +781,10 @@ async def save_docx_from_html(
     docx_url: Annotated[str, Field(description="원본 DOCX URL")],
     edited_html: Annotated[str, Field(description="편집된 HTML (data-id 포함)")],
     output_name: Annotated[Optional[str], Field(description="저장할 DOCX 파일명")] = "",
+    tenant_id: Annotated[Optional[str], Field(description="테넌트 ID (자동 주입)")] = "",
+    user_jwt: Annotated[Optional[str], Field(description="사용자 JWT (자동 주입)")] = "",
+    user_uid: Annotated[Optional[str], Field(description="사용자 UID (자동 주입)")] = "",
+    user_email: Annotated[Optional[str], Field(description="사용자 이메일 (자동 주입)")] = "",
 ) -> dict:
     """편집된 HTML을 DOCX로 반영하고 스토리지 URL로 반환한다."""
     if not docx_url:
@@ -779,6 +848,10 @@ async def generate_slides(
     slide_count: Annotated[Optional[int], Field(description="슬라이드 개수 (0이면 자동)")] = 0,
     style: Annotated[Optional[str], Field(description="스타일/색감 가이드")] = "",
     report_id: Annotated[Optional[str], Field(description="이미지 스토리지 경로용 ID")] = "",
+    tenant_id: Annotated[Optional[str], Field(description="테넌트 ID (memento RAG 검색용)")] = "",
+    user_jwt: Annotated[Optional[str], Field(description="사용자 JWT (자동 주입)")] = "",
+    user_uid: Annotated[Optional[str], Field(description="사용자 UID (자동 주입)")] = "",
+    user_email: Annotated[Optional[str], Field(description="사용자 이메일 (자동 주입)")] = "",
 ) -> dict:
     """슬라이드 마크다운과 이미지를 생성해 반환한다."""
     import asyncio as _asyncio
@@ -794,7 +867,25 @@ async def generate_slides(
         outline = _json.loads(outline_json) if outline_json else []
         sources = _json.loads(sources_json) if sources_json else []
 
-        # outline/sources가 비어있으면 Tavily로 자동 웹 검색
+        # tenant_id가 있으면 memento에서 내부 지식 자료를 검색해 sources에 추가
+        if (tenant_id or "").strip():
+            try:
+                from .memento import search_memento_smart
+                logger.info("generate_slides: memento RAG 검색 시작 (tenant_id=%s)", tenant_id)
+                memento_sources = await search_memento_smart(
+                    query=research_goal,
+                    outline=outline if outline else [research_goal],
+                    tenant_id=tenant_id.strip(),
+                )
+                if memento_sources:
+                    sources = memento_sources + sources
+                    logger.info("generate_slides: memento 소스 %d개 추가 (총 %d개)", len(memento_sources), len(sources))
+                else:
+                    logger.info("generate_slides: memento 검색 결과 없음")
+            except Exception as exc:
+                logger.warning("generate_slides: memento 검색 실패 (Tavily 폴백): %s", exc)
+
+        # outline/sources가 여전히 비어있으면 Tavily로 자동 웹 검색
         if not outline and not sources:
             from .search import research_for_slides
             logger.info("generate_slides: 웹 검색 시작 — %s", research_goal)

@@ -6,7 +6,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from hwpx_mcp.mcp_server import mcp
+from office_mcp.mcp_server import mcp
 
 
 async def edit_slide_image(request: Request) -> JSONResponse:
@@ -19,7 +19,7 @@ async def edit_slide_image(request: Request) -> JSONResponse:
         { "image_base64": "<base64>", "mime_type": "image/png" }
     """
     import httpx
-    from hwpx_mcp.images import edit_image_gemini_bytes
+    from office_mcp.images import edit_image_gemini_bytes
 
     try:
         body = await request.json()
@@ -87,20 +87,21 @@ rest_routes = [
 ]
 
 
+app = mcp.http_app(
+    transport="http",
+    json_response=True,
+    stateless_http=True,
+    middleware=[
+        Middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+    ],
+)
+# MCP 앱에 REST 라우트 추가
+app.routes.extend(rest_routes)
+
 if __name__ == "__main__":
-    app = mcp.http_app(
-        transport="http",
-        json_response=True,
-        stateless_http=True,
-        middleware=[
-            Middleware(
-                CORSMiddleware,
-                allow_origins=["*"],
-                allow_methods=["*"],
-                allow_headers=["*"],
-            )
-        ],
-    )
-    # MCP 앱에 REST 라우트 추가
-    app.routes.extend(rest_routes)
     uvicorn.run(app, host="0.0.0.0", port=1192, lifespan="on")

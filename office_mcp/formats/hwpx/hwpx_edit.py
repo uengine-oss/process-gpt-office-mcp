@@ -3,11 +3,11 @@ import os
 import tempfile
 from xml.etree import ElementTree as ET
 
-from .core.html_edit import extract_fills_and_ids
-from .core.filler import apply_fills
-from .core.parser import parse_section
-from .core.xml_utils import tag as core_tag
-from .io.file import extract_hwpx, find_section_files, repack_hwpx
+from ...core.html_edit import extract_fills_and_ids
+from ...core.filler import apply_fills
+from ...core.parser import parse_section
+from ...core.xml_utils import tag as core_tag
+from ...io.file import extract_hwpx, find_section_files, repack_hwpx
 
 
 logger = logging.getLogger("process-gpt-office-mcp")
@@ -101,7 +101,14 @@ def apply_html_edits_to_hwpx(
                 if getattr(node, "type", "") == "table_cell" and node.table_idx >= 0:
                     table_nodes.setdefault(node.table_idx, []).append(global_id)
                 if global_id in edits:
-                    fills.append({"id": node.id, "new_text": edits[global_id]})
+                    # 원본 텍스트와 동일하면 XML 구조 보존을 위해 건너뜀
+                    import re as _re
+                    original_norm = _re.sub(r"\s+", "", (node.raw_text or ""))
+                    new_norm = _re.sub(r"\s+", "", (edits[global_id] or ""))
+                    if original_norm != new_norm:
+                        fills.append({"id": node.id, "new_text": edits[global_id]})
+                    else:
+                        logger.debug("[html_edit] 원본 동일 → 건너뜀: gid=%d len=%d", global_id, len(original_norm))
             remove_table_indices: set[int] = set()
             for tbl_idx, ids in table_nodes.items():
                 if ids and not any(node_id in present_ids for node_id in ids):

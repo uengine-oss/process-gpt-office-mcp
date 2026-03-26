@@ -30,6 +30,10 @@ def apply_fills(
         for f in fills
         if isinstance(f, dict) and "id" in f and "new_text" in f
     }
+    node_ids_in_list = sorted([n.id for n in nodes if n.id is not None])
+    missing_in_nodes = [k for k in fill_map if k not in node_ids_in_list]
+    logger.info("[apply_fills] fill_map keys=%d, nodes=%d, fill_map에 있지만 nodes에 없는 ID=%s",
+                len(fill_map), len(nodes), missing_in_nodes[:20] if missing_in_nodes else "없음")
 
     def _leading_ws(node: TextNode) -> str:
         if not node.raw_text:
@@ -38,10 +42,6 @@ def apply_fills(
         return raw[:len(raw) - len(raw.lstrip(" "))]
 
     def _normalize_checkbox(node: TextNode, new_text: str) -> str:
-        if "[  ]" not in (node.text or ""):
-            return new_text
-        if "[" not in new_text:
-            return (node.text or "").replace("[  ]", "[✓]")
         return new_text
 
     def _table_first_cell_map() -> dict[int, str]:
@@ -100,6 +100,8 @@ def apply_fills(
             if target_run is None and node.run_elements:
                 target_run = node.run_elements[0]
             if target_run is None:
+                logger.warning("[정리] node %d: target_run=None (t=%d, run=%d) → 건너뜀",
+                               node.id, len(node.t_elements), len(node.run_elements))
                 continue
             parent_p = find_parent(target_run, parent_map, "p")
             if parent_p is None:
@@ -134,17 +136,30 @@ def apply_fills(
                         break
 
         tbl_index = -1
+        logger.info("[정리] remove_table_indices=%s", remove_table_indices)
         for tbl in list(root.iter()):
             if tag(tbl) != "tbl":
                 continue
             if find_parent(tbl, local_parent, "tbl") is not None:
                 continue
             tbl_index += 1
+            # 첫 셀 텍스트 (디버그용)
+            _dbg_text = ""
+            for _tc in tbl.iter():
+                if tag(_tc) == "t" and (_tc.text or "").strip():
+                    _dbg_text = (_tc.text or "").strip()[:20]
+                    break
             if tbl_index in remove_table_indices:
+                logger.info("[정리] 표%d 삭제 시도 (첫텍스트='%s')", tbl_index, _dbg_text)
                 parent = local_parent.get(tbl)
                 if parent is not None:
                     if _safe_remove(parent, tbl):
                         tbl_removed += 1
+                        logger.info("[정리] 표%d 삭제 성공", tbl_index)
+                    else:
+                        logger.warning("[정리] 표%d 삭제 실패 (_safe_remove=False)", tbl_index)
+                else:
+                    logger.warning("[정리] 표%d 삭제 실패 (parent=None)", tbl_index)
                 continue
             first_cell_text = ""
             for tc in tbl.iter():
@@ -188,12 +203,20 @@ def apply_fills(
         if prefix:
             new_text = f"{prefix}{new_text}"
 
+        # 원본 텍스트와 동일하면 XML 구조 보존을 위해 건너뜀 (공백 무시 비교)
+        import re as _re
+        if _re.sub(r"\s+", "", new_text) == _re.sub(r"\s+", "", node.raw_text or ""):
+            logger.info("[fill] node %d: 원본과 동일 → 건너뜀", node.id)
+            continue
+
         target_run = None
         if node.t_elements:
             target_run = find_parent(node.t_elements[0], parent_map, "run")
         if target_run is None and node.run_elements:
             target_run = node.run_elements[0]
         if target_run is None:
+            logger.warning("[fill] node %d: target_run=None (t_elements=%d, run_elements=%d) → 건너뜀",
+                           node.id, len(node.t_elements), len(node.run_elements))
             continue
 
         parent_p = find_parent(target_run, parent_map, "p")
@@ -201,6 +224,7 @@ def apply_fills(
 
         if node.t_elements:
             node.t_elements[0].text = new_text
+            logger.info("[fill] node %d: t_elements[0] 텍스트 교체 (%d자, t_elements=%d개)", node.id, len(new_text), len(node.t_elements))
             for extra_t in node.t_elements[1:]:
                 extra_run = find_parent(extra_t, parent_map, "run")
                 if extra_run is not None:
@@ -216,6 +240,7 @@ def apply_fills(
             new_t = ET.Element(t_tag)
             target_run.insert(0, new_t)
             new_t.text = new_text
+            logger.info("[fill] node %d: t 요소 새로 생성 (run에 삽입, %d자)", node.id, len(new_text))
 
     _remove_instruction_content(tree.getroot())
 

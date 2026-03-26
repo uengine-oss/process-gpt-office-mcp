@@ -613,6 +613,224 @@ def apply_image_markers_to_section(
     return inserted
 
 
+def _download_image(url: str, timeout: int = 30) -> bytes | None:
+    """URL에서 이미지를 다운로드하여 bytes로 반환한다."""
+    import httpx
+
+    try:
+        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+            resp = client.get(url)
+            resp.raise_for_status()
+            return resp.content
+    except Exception as exc:
+        logger.warning("[이미지참조] 다운로드 실패 (%s): %s", url, exc)
+        return None
+
+
+def apply_reference_images_to_section(
+    tree: ET.ElementTree,
+    section_path: str,
+    parent_map: dict,
+    reference_images: list[dict],
+    t_ns: str = "",
+    write_back: bool = False,
+) -> int:
+    """URL 기반 참조 이미지를 섹션에 삽입한다.
+
+    reference_images: [{"node": TextNode, "image_url": str, "caption": str}, ...]
+    Gemini 생성 대신 URL에서 이미지를 다운로드하여 삽입하는 것 외에는
+    apply_image_markers_to_section과 동일한 XML 삽입 로직을 사용한다.
+    """
+    if not reference_images:
+        return 0
+
+    extract_dir = Path(section_path).parent.parent
+    bindata_dir = extract_dir / "BinData"
+    bindata_dir.mkdir(parents=True, exist_ok=True)
+    content_hpf = extract_dir / "Contents" / "content.hpf"
+    meta_manifest = extract_dir / "META-INF" / "manifest.xml"
+
+    inserted = 0
+    next_idx = _next_image_index(bindata_dir)
+    root = tree.getroot()
+    next_pic_id = _next_max_attr(root, "id") + 1
+    next_inst_id = _next_max_attr(root, "instid") + 1
+    local_parent = {c: p for p in root.iter() for c in p}
+    center_para_pr_id = _find_center_para_pr_id(extract_dir / "Contents" / "header.xml")
+
+    # 이미지 병렬 다운로드
+    import concurrent.futures as _cf
+
+    image_bytes_list: list[bytes | None] = [None] * len(reference_images)
+    download_tasks = [
+        (idx, item.get("image_url") or "")
+        for idx, item in enumerate(reference_images)
+        if (item.get("image_url") or "").strip()
+    ]
+    if download_tasks:
+        logger.info(
+            "[이미지참조·다운로드] 병렬 다운로드 시작 %d건: %s",
+            len(download_tasks),
+            [url[:60] for _, url in download_tasks],
+        )
+        import time as _time
+        t_dl = _time.perf_counter()
+        with _cf.ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {
+                executor.submit(_download_image, url): (idx, url)
+                for idx, url in download_tasks
+            }
+            done, not_done = _cf.wait(futures.keys(), timeout=60)
+            for future in done:
+                idx, url = futures[future]
+                try:
+                    data = future.result()
+                    image_bytes_list[idx] = data
+                    if data:
+                        logger.info("[이미지참조·다운로드] [%d] 성공 — %.1f KB (%s)",
+                                    idx, len(data) / 1024, url[:60])
+                    else:
+                        logger.warning("[이미지참조·다운로드] [%d] 실패 — 빈 응답 (%s)", idx, url[:60])
+                except Exception as exc:
+                    logger.warning("[이미지참조·다운로드] [%d] 예외 — %s (%s)", idx, exc, url[:60])
+            if not_done:
+                logger.warning("[이미지참조·다운로드] 타임아웃 %d건", len(not_done))
+                for future in not_done:
+                    future.cancel()
+        dl_ok = sum(1 for b in image_bytes_list if b)
+        logger.info("[이미지참조·다운로드] 완료: %d/%d건 성공 (%.1fs)", dl_ok, len(download_tasks), _time.perf_counter() - t_dl)
+
+    for idx, item in enumerate(reference_images):
+        node = item.get("node")
+        caption = (item.get("caption") or "").strip()
+        # 캡션이 너무 길면 문장 단위로 자름
+        if len(caption) > 200:
+            # 200자 이내에서 마지막 마침표 위치로 자름
+            cut = caption[:200].rfind(".")
+            caption = caption[:cut + 1] if cut > 50 else caption[:197] + "..."
+
+        image_bytes = image_bytes_list[idx]
+        if not image_bytes:
+            logger.warning("[이미지참조·삽입] [%d] 건너뜀 — 이미지 데이터 없음", idx)
+            continue
+        if not node:
+            logger.warning("[이미지참조·삽입] [%d] 건너뜀 — 대상 노드 없음", idx)
+            continue
+
+        fmt = _detect_image_format(image_bytes) or "png"
+        ext = "jpg" if fmt == "jpeg" else fmt
+        media_type = f"image/{fmt}"
+        bin_name = f"image{next_idx}.{ext}"
+        bin_path = bindata_dir / bin_name
+        bin_path.write_bytes(image_bytes)
+
+        bin_item_id = f"image{next_idx}"
+        _ensure_manifest_item(content_hpf, bin_item_id, f"BinData/{bin_name}", media_type)
+        _ensure_meta_manifest_entry(meta_manifest, f"BinData/{bin_name}", media_type)
+
+        target_run = None
+        if node.t_elements:
+            from .core.xml_utils import find_parent
+            target_run = find_parent(node.t_elements[0], local_parent, "run")
+        if target_run is None and node.run_elements:
+            target_run = node.run_elements[0]
+        if target_run is None:
+            logger.warning("[이미지참조·삽입] [%d] 건너뜀 — target_run 탐색 실패 (node %d)", idx, node.id)
+            next_idx += 1
+            continue
+
+        from .core.xml_utils import find_parent
+        parent_p = find_parent(target_run, local_parent, "p")
+        if parent_p is None:
+            logger.warning("[이미지참조·삽입] [%d] 건너뜀 — 부모 문단 탐색 실패 (node %d)", idx, node.id)
+            next_idx += 1
+            continue
+
+        char_pr = target_run.get("charPrIDRef")
+        width_px, height_px = _image_size_from_bytes(image_bytes)
+
+        # 삽입 대상 크기에 맞춰 이미지 크기 결정
+        PAGE_BODY_WIDTH_HWP = 42000   # 본문 너비의 약 60% (≈ 148mm)
+        MIN_IMAGE_WIDTH_HWP = 28000   # 이미지 최소 너비 (≈ 98mm) — 너무 작으면 안 보임
+
+        if getattr(node, "type", "") == "table_cell" and getattr(node, "cell_width", 0) > 0:
+            # 표 셀: 셀 너비에 맞추되, 최소 너비 보장
+            target_width = max(int(node.cell_width * 0.9), MIN_IMAGE_WIDTH_HWP)
+            # 셀 높이 제한은 적용하지 않음 — 표 셀은 이미지에 맞춰 자동 확장됨
+            target_height = 0
+        else:
+            # 본문 텍스트: 페이지 본문 너비의 약 60%
+            target_width = PAGE_BODY_WIDTH_HWP
+            target_height = 0
+
+        if width_px and height_px:
+            aspect = height_px / width_px
+            width_hwp = target_width
+            height_hwp = int(target_width * aspect)
+            # 높이 제한이 있고 초과하면 높이에 맞춰 축소
+            if target_height > 0 and height_hwp > target_height:
+                height_hwp = target_height
+                width_hwp = int(target_height / aspect)
+        else:
+            width_hwp = target_width
+            height_hwp = int(target_width * 9 / 16)
+
+        clip_scale = 3.125
+
+        logger.info(
+            "[이미지참조·삽입] [%d] node=%d fmt=%s px=%sx%s hwp=%sx%s bin=%s caption=%s",
+            idx, node.id, fmt, width_px, height_px, width_hwp, height_hwp,
+            bin_name, caption[:30] if caption else "(없음)",
+        )
+        pic_run = _build_pic_run(
+            t_ns,
+            bin_item_id,
+            width_hwp=width_hwp,
+            height_hwp=height_hwp,
+            char_pr_id_ref=char_pr,
+            pic_id=str(next_pic_id),
+            inst_id=str(next_inst_id),
+            clip_scale=clip_scale,
+            caption_text=caption,
+            caption_para_pr_id_ref=center_para_pr_id or parent_p.get("paraPrIDRef"),
+            caption_char_pr_id_ref=char_pr,
+        )
+
+        p_tag = f"{t_ns}p" if t_ns else "p"
+        pic_p = ET.Element(p_tag)
+        pic_p.attrib.update(parent_p.attrib)
+        if center_para_pr_id:
+            pic_p.set("paraPrIDRef", center_para_pr_id)
+        pic_p.set("id", _next_paragraph_id(root))
+        pic_p.append(pic_run)
+
+        parent = local_parent.get(parent_p)
+        if parent is None:
+            next_idx += 1
+            continue
+        p_siblings = list(parent)
+        try:
+            p_idx = p_siblings.index(parent_p)
+        except ValueError:
+            p_idx = len(p_siblings) - 1
+        parent.insert(p_idx + 1, pic_p)
+
+        logger.info("[이미지참조·삽입] [%d] 성공 — node=%d, pic_id=%s, bin=%s",
+                    idx, node.id, next_pic_id, bin_name)
+        inserted += 1
+        next_idx += 1
+        next_pic_id += 1
+        next_inst_id += 1
+
+    failed = len(reference_images) - inserted
+    if inserted or failed:
+        logger.info("[이미지참조·삽입] 최종 결과: 성공=%d 실패=%d / 전체=%d",
+                    inserted, failed, len(reference_images))
+    if inserted and write_back:
+        _write_xml_with_header(Path(section_path), tree)
+    return inserted
+
+
 def _get_client():
     try:
         from google import genai
