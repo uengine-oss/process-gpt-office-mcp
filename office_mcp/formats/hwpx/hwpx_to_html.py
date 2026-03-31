@@ -1,4 +1,5 @@
 import argparse
+import base64
 import html
 import re
 import zipfile
@@ -14,6 +15,84 @@ NS = {
     "hh": "http://www.hancom.co.kr/hwpml/2011/head",
     "hc": "http://www.hancom.co.kr/hwpml/2011/core",
 }
+
+_IMG_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+
+
+def _detect_image_format_simple(data: bytes) -> str:
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if data[:2] == b"\xff\xd8":
+        return "jpeg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return "png"
+
+
+def _parse_bindata_map(zipf: zipfile.ZipFile) -> dict[str, bytes]:
+    """binary item ID → image bytes (BinData 폴더의 이미지를 메모리에 적재)"""
+    id_to_path: dict[str, str] = {}
+    try:
+        hpf_xml = zipf.read("Contents/content.hpf").decode("utf-8", errors="replace")
+        hpf_root = ET.fromstring(hpf_xml)
+        for elem in hpf_root.iter():
+            if elem.tag.split("}")[-1] == "item":
+                item_id = elem.get("id")
+                href = elem.get("href")
+                if item_id and href:
+                    id_to_path[item_id] = href
+    except Exception:
+        pass
+
+    result: dict[str, bytes] = {}
+    for name in zipf.namelist():
+        low = name.lower()
+        if not (low.startswith("bindata/") or low.startswith("contents/bindata/")):
+            continue
+        if Path(name).suffix.lower() not in _IMG_EXTS:
+            continue
+        stem = Path(name).stem
+        matched_id = None
+        name_low = name.lower()
+        for item_id, href in id_to_path.items():
+            if href.lower() == name_low or href.lower().endswith("/" + Path(name).name.lower()):
+                matched_id = item_id
+                break
+        key = matched_id if matched_id else stem
+        try:
+            result[key] = zipf.read(name)
+        except Exception:
+            pass
+    return result
+
+
+def _render_pic(pic: ET.Element, img_map: dict[str, bytes]) -> str:
+    """pic XML 요소를 base64 data URI img 태그로 변환한다."""
+    img_elem = pic.find("hc:img", NS)
+    if img_elem is None:
+        return ""
+    bin_ref = img_elem.get("binaryItemIDRef", "")
+    if not bin_ref:
+        return ""
+    img_bytes = img_map.get(bin_ref)
+    if not img_bytes:
+        return ""
+    sz = pic.find("hp:sz", NS)
+    style_parts: list[str] = ["display:inline-block", "max-width:100%"]
+    if sz is not None:
+        w_px = _hwpunit_to_px(sz.get("width"))
+        h_px = _hwpunit_to_px(sz.get("height"))
+        if w_px:
+            style_parts.append(f"width:{w_px}")
+        if h_px:
+            style_parts.append(f"height:{h_px}")
+    fmt = _detect_image_format_simple(img_bytes)
+    mime = "image/jpeg" if fmt == "jpeg" else f"image/{fmt}"
+    b64 = base64.b64encode(img_bytes).decode("ascii")
+    style = ";".join(style_parts)
+    return f'<img src="data:{mime};base64,{b64}" style="{style}" />'
 
 
 def _css_escape(value: str) -> str:
@@ -364,6 +443,7 @@ def _render_runs(
     spacing_px=None,
     in_table=False,
     node_id_map=None,
+    img_map=None,
 ):
     blocks = []
     current_segments = []
@@ -419,8 +499,17 @@ def _render_runs(
                     border_fills,
                     styles,
                     node_id_map=node_id_map,
+                    img_map=img_map,
                 )
             )
+            continue
+
+        pic = run.find("hp:pic", NS)
+        if pic is not None:
+            flush_paragraph()
+            img_html = _render_pic(pic, img_map or {})
+            if img_html:
+                blocks.append(img_html)
             continue
 
         run_char_id = run.attrib.get("charPrIDRef") or base_char_id
@@ -570,7 +659,7 @@ def _table_max_bottom(tbl):
     return max_bottom
 
 
-def _render_table(tbl, char_styles, para_styles, border_fills, styles, rows=None, node_id_map=None):
+def _render_table(tbl, char_styles, para_styles, border_fills, styles, rows=None, node_id_map=None, img_map=None):
     tbl_style = {}
     sz = tbl.find("hp:sz", NS)
     if sz is not None:
@@ -669,6 +758,7 @@ def _render_table(tbl, char_styles, para_styles, border_fills, styles, rows=None
                     styles,
                     use_lineseg=False,
                     in_table=True,
+                    img_map=img_map,
                 )
                 cell_content = "".join(blocks)
                 vert = sub_list.attrib.get("vertAlign")
@@ -793,6 +883,7 @@ def _render_children(
     use_lineseg=True,
     in_table=False,
     node_id_map=None,
+    img_map=None,
 ):
     blocks = []
     for idx, child in enumerate(children):
@@ -869,11 +960,12 @@ def _render_children(
                     spacing_px=spacing_px,
                     in_table=in_table,
                     node_id_map=node_id_map,
+                    img_map=img_map,
                 )
             )
         elif tag == "tbl":
             blocks.append(
-                _render_table(child, char_styles, para_styles, border_fills, styles, node_id_map=node_id_map)
+                _render_table(child, char_styles, para_styles, border_fills, styles, node_id_map=node_id_map, img_map=img_map)
             )
     return blocks
 
@@ -887,6 +979,7 @@ def _render_block_list(
     use_lineseg=True,
     in_table=False,
     node_id_map=None,
+    img_map=None,
 ):
     return _render_children(
         list(parent),
@@ -897,6 +990,7 @@ def _render_block_list(
         use_lineseg=use_lineseg,
         in_table=in_table,
         node_id_map=node_id_map,
+        img_map=img_map,
     )
 
 
@@ -912,6 +1006,13 @@ def _build_node_id_maps(root: ET.Element) -> tuple[dict, dict, int]:
                 continue
             for tc in tr:
                 if core_tag(tc) != "tc":
+                    continue
+                # 중첩 표가 있는 셀은 건너뛰고 내부 표의 셀만 처리
+                # (parse_section과 동일한 로직)
+                nested_tbls = [ch for ch in tc.iter() if core_tag(ch) == "tbl"]
+                if nested_tbls:
+                    for nested_tbl in nested_tbls:
+                        _process_table(nested_tbl)
                     continue
                 tc_id_map[tc] = nid
                 nid += 1
@@ -974,6 +1075,7 @@ def hwpx_to_html(hwpx_path: Path, output_path: Path, use_lineseg: bool, inject_i
     with zipfile.ZipFile(hwpx_path) as zipf:
         char_styles, para_styles, border_fills, styles = _parse_header(zipf)
         section_names = _sorted_section_names(zipf)
+        img_map = _parse_bindata_map(zipf)
         body_blocks = []
         global_offset = 0
         for section in section_names:
@@ -1021,6 +1123,7 @@ def hwpx_to_html(hwpx_path: Path, output_path: Path, use_lineseg: bool, inject_i
                         pchildren, char_styles, para_styles,
                         border_fills, styles,
                         use_lineseg=use_lineseg, node_id_map=node_id_map,
+                        img_map=img_map,
                     )
                     body_blocks.append(
                         f"<div class=\"page\" style=\"{_build_style(page_style)}\">"
@@ -1111,6 +1214,7 @@ def hwpx_to_html(hwpx_path: Path, output_path: Path, use_lineseg: bool, inject_i
                                     styles,
                                     use_lineseg=use_lineseg,
                                     node_id_map=node_id_map,
+                                    img_map=img_map,
                                 )
                                 body_blocks.append(
                                     f"<div class=\"page\" style=\"{_build_style(page_style)}\">"
@@ -1138,6 +1242,7 @@ def hwpx_to_html(hwpx_path: Path, output_path: Path, use_lineseg: bool, inject_i
                                     border_fills,
                                     styles,
                                     use_lineseg=use_lineseg,
+                                    img_map=img_map,
                                 )
                                 body_blocks.append(
                                     f"<div class=\"page\" style=\"{_build_style(page_style)}\">"
@@ -1154,6 +1259,7 @@ def hwpx_to_html(hwpx_path: Path, output_path: Path, use_lineseg: bool, inject_i
                                     styles,
                                     rows=rows,
                                     node_id_map=node_id_map,
+                                    img_map=img_map,
                                 )
                                 body_blocks.append(
                                     f"<div class=\"page\" style=\"{_build_style(page_style)}\">"
@@ -1178,6 +1284,7 @@ def hwpx_to_html(hwpx_path: Path, output_path: Path, use_lineseg: bool, inject_i
                                 styles,
                                 use_lineseg=use_lineseg,
                                 node_id_map=node_id_map,
+                                img_map=img_map,
                             )
                             body_blocks.append(
                                 f"<div class=\"page\" style=\"{_build_style(page_style)}\">"
@@ -1200,6 +1307,7 @@ def hwpx_to_html(hwpx_path: Path, output_path: Path, use_lineseg: bool, inject_i
                                 styles,
                                 use_lineseg=use_lineseg,
                                 node_id_map=node_id_map,
+                                img_map=img_map,
                             )
                             body_blocks.append(
                                 f"<div class=\"page\" style=\"{_build_style(page_style)}\">"
@@ -1217,6 +1325,7 @@ def hwpx_to_html(hwpx_path: Path, output_path: Path, use_lineseg: bool, inject_i
                                 styles,
                                 use_lineseg=use_lineseg,
                                 node_id_map=node_id_map,
+                                img_map=img_map,
                             )
                             body_blocks.append(
                                 f"<div class=\"page\" style=\"{_build_style(page_style)}\">"
@@ -1239,6 +1348,7 @@ def hwpx_to_html(hwpx_path: Path, output_path: Path, use_lineseg: bool, inject_i
                         styles,
                         use_lineseg=use_lineseg,
                         node_id_map=node_id_map,
+                        img_map=img_map,
                     )
                     body_blocks.append(
                         f"<div class=\"page\" style=\"{_build_style(page_style)}\">"

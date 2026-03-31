@@ -150,6 +150,7 @@ def apply_html_edits_to_hwpx(
                         removed,
                     )
             if fills or remove_table_indices:
+                _header_path = os.path.join(extract_dir, "Contents", "header.xml")
                 apply_fills(
                     nodes,
                     fills,
@@ -159,6 +160,7 @@ def apply_html_edits_to_hwpx(
                     instruction_ids=set(),
                     remove_table_indices=set(),
                     t_ns=t_ns,
+                    header_path=_header_path if os.path.exists(_header_path) else None,
                 )
             global_offset += len(nodes)
 

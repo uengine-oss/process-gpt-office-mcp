@@ -81,9 +81,51 @@ async def edit_slide_image(request: Request) -> JSONResponse:
     })
 
 
+async def enhance_image(request: Request) -> JSONResponse:
+    """HWPX 뷰어용 이미지 AI 개선 REST 엔드포인트.
+
+    Body JSON:
+        image_base64 (str): base64 인코딩된 원본 이미지
+        mime_type    (str): 이미지 MIME 타입 (기본값: image/png)
+        instruction  (str): 개선 지시사항 (선택, 기본값 제공)
+    Returns:
+        { "image_base64": "<base64>", "mime_type": "image/png" }
+    """
+    from office_mcp.images import edit_image_gemini_bytes
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    image_b64 = (body.get("image_base64") or "").strip()
+    mime_type = (body.get("mime_type") or "image/png").strip()
+    instruction = (body.get("instruction") or
+                   "이 이미지를 더 선명하고 고품질로 개선해줘. "
+                   "세부 디테일을 살리고 색감을 풍부하게, 깔끔한 인포그래픽 스타일로 다시 그려줘.").strip()
+
+    if not image_b64:
+        return JSONResponse({"error": "image_base64 is required"}, status_code=400)
+
+    try:
+        image_bytes = base64.b64decode(image_b64)
+    except Exception:
+        return JSONResponse({"error": "Invalid base64 data"}, status_code=400)
+
+    result = edit_image_gemini_bytes(image_bytes, instruction, mime_type)
+    if result is None:
+        return JSONResponse({"error": "Gemini 이미지 개선 실패"}, status_code=500)
+
+    return JSONResponse({
+        "image_base64": base64.b64encode(result).decode(),
+        "mime_type": "image/png",
+    })
+
+
 # REST 라우트
 rest_routes = [
     Route("/api/edit-slide-image", edit_slide_image, methods=["POST"]),
+    Route("/api/enhance-image", enhance_image, methods=["POST"]),
 ]
 
 

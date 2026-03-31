@@ -743,10 +743,21 @@ skip_fill=true인 노드는 작성하지 마세요.
 ★ 서식 마커("□", "가.", "ㅇ") 작성법:
   마커를 포함한 전체 텍스트를 작성하세요.
   "가." 노드에는 가/나/다 소제목과 각 소제목 아래 ㅇ 불릿 내용을 전부 포함하세요.
-  예: "가. 현장 운영 환경\n  ㅇ 내용...\n  ㅇ 내용...\n\n나. 디지털 전환 요구\n  ㅇ 내용...\n\n다. 혁신 방향\n  ㅇ 내용..."
+  ★ 들여쓰기로 계층 구조를 반드시 표현하세요:
+    □ 는 최상위 (들여쓰기 없음)
+    가./나./다. 는 2칸 들여쓰기
+    ㅇ 는 4칸 들여쓰기
+  예:
+  "□ 추진배경 및 필요성\n\n  가. 현장 운영 환경\n    ㅇ 내용...\n    ㅇ 내용...\n\n  나. 디지털 전환 요구\n    ㅇ 내용...\n\n  다. 혁신 방향\n    ㅇ 내용..."
 
 ★ 표 셀은 data-size(WxH mm)에 맞게 분량을 조절하세요. 작은 셀은 한 문장, 큰 셀은 충분히.
 ★ 정부 R&D 제안서 수준의 분량으로 구체적이고 충실하게 작성하세요.
+
+★ 이미지 삽입: 시스템 구성도, 아키텍처, 추진체계도, 기대효과 비교 등 시각자료가 효과적인 곳에는
+  텍스트 중간이나 끝에 [IMAGE:이미지 설명 프롬프트] 마커를 삽입하세요.
+  예: "... 시스템 구성은 다음과 같다.\n[IMAGE:AI 비전검사 시스템 아키텍처 구성도]\n위 구성을 통해..."
+  단, 단순 텍스트(인력, 예산, 일정 등)에는 이미지 마커를 넣지 마세요.
+  본문 노드(큰 영역)에만 넣고, 작은 표 셀에는 넣지 마세요.
 
 ## 출력(JSON)
 ★ id는 반드시 HTML의 data-id 속성값을 그대로 사용하세요 (0부터 시작하는 순번 아님).
@@ -832,17 +843,22 @@ async def agent_select_reference_images(
     analysis: dict,
     report_topic: str,
     max_select: int = 2,
+    chunk_image_b64: str = "",
 ) -> list[dict]:
     """검색된 이미지 후보 중 청크에 삽입할 이미지를 AI가 선택한다.
 
+    LLM이 스크린샷과 노드 정보를 보고, 어떤 이미지를 어떤 노드에 넣을지까지 결정한다.
+
     Args:
         candidates: [{"image_id", "image_url", "caption", ...}, ...]
+        chunk_image_b64: 청크 스크린샷 (base64)
     Returns:
-        선택된 이미지 목록 [{"image_url", "caption", "reason"}, ...]
+        선택된 이미지 목록 [{"image_url", "caption", "reason", "target_node_id"}, ...]
     """
     if not candidates:
         return []
 
+    # 채울 노드 목록 (data-id, 타입, 크기, 텍스트 포함)
     fill_nodes_info = []
     node_map = {n.id: n for n in nodes}
     for item in (analysis.get("nodes") or []):
@@ -850,9 +866,18 @@ async def agent_select_reference_images(
         if action in ("write", "replace") and not item.get("skip_fill"):
             nid = item.get("id")
             node = node_map.get(nid)
-            if node:
-                text = (node.text or "")[:60]
-                fill_nodes_info.append(f"- {text}" if text else "- (빈칸)")
+            if not node:
+                continue
+            text = (node.text or "")[:60]
+            ntype = getattr(node, "type", "")
+            size_info = ""
+            if ntype == "table_cell":
+                w = round((getattr(node, "cell_width", 0) or 0) / 283.46) if getattr(node, "cell_width", 0) else 0
+                h = round((getattr(node, "cell_height", 0) or 0) / 283.46) if getattr(node, "cell_height", 0) else 0
+                if w > 0 and h > 0:
+                    size_info = f" ({w}x{h}mm)"
+            label = f"- data-id={nid} [{ntype}{size_info}] {text}" if text else f"- data-id={nid} [{ntype}{size_info}] (빈칸)"
+            fill_nodes_info.append(label)
 
     candidates_text = ""
     for i, img in enumerate(candidates[:15]):
@@ -871,13 +896,16 @@ async def agent_select_reference_images(
 
     prompt_sys = (
         "당신은 보고서 작성 보조 AI입니다. "
-        "검색된 이미지 후보 목록에서 보고서 청크에 삽입하면 효과적인 이미지를 선택하세요."
+        "검색된 이미지 후보 목록에서 보고서 청크에 삽입하면 효과적인 이미지를 선택하세요.\n"
+        "★ 스크린샷이 제공되면 실제 양식 레이아웃을 반드시 참고하세요. "
+        "작은 셀(요약, 기관명 등)에는 이미지를 넣지 마세요. "
+        "이미지는 넓고 충분한 공간이 있는 노드(본문 영역, 큰 표 셀)에만 삽입하세요."
     )
     prompt_user = f"""## 보고서 주제
 {report_topic}
 
-## 이 청크에서 작성 중인 항목들
-{chr(10).join(fill_nodes_info[:10])}
+## 이 청크에서 작성할 노드 목록 (data-id, 타입, 크기, 텍스트)
+{chr(10).join(fill_nodes_info[:15])}
 
 ## 이미지 후보 목록
 {candidates_text}
@@ -886,14 +914,24 @@ async def agent_select_reference_images(
 위 후보 중 이 청크에 삽입하면 보고서의 설득력·이해도를 높일 이미지를 최대 {max_select}개 선택하세요.
 - 출처 문서명과 캡션 내용을 함께 고려하여 청크 주제와 관련 있는 이미지만 선택하세요.
 - 관련 없거나 품질이 낮아 보이면 하나도 선택하지 않아도 됩니다.
-- 선택한 이미지마다 보고서에 표시할 **짧은 캡션**(15~30자, 한국어)을 작성하세요.
-  캡션은 이미지의 핵심 내용을 한 문장으로 요약한 것이어야 합니다.
-  예: "AI 비전 검사 시스템 구성도", "공정 전후 불량률 비교 차트"
+- 선택한 이미지마다:
+  1. 보고서에 표시할 **짧은 캡션**(15~30자, 한국어)을 작성하세요.
+  2. **삽입할 노드의 data-id**를 지정하세요.
+     ★ 이미지를 넣기에 충분한 공간이 있는 노드만 선택하세요.
+     ★ 작은 셀(요약 3줄, 기관명, 수행기간 등)에는 절대 넣지 마세요.
+     ★ 본문 영역이나 큰 서술형 셀(추진전략, 사업범위, 목표 등)에 넣으세요.
 
 ## 출력(JSON)
-{{"selected": [{{"index": 0, "reason": "선택 이유", "caption": "보고서용 짧은 캡션"}}]}}
+{{"selected": [{{"index": 0, "target_node_id": 297, "reason": "선택 이유", "caption": "보고서용 짧은 캡션"}}]}}
 """
-    result = await asyncio.to_thread(_call_llm_json, prompt_sys, prompt_user, 0.2)
+    if chunk_image_b64:
+        result = await asyncio.to_thread(
+            _call_llm_vision_json, prompt_sys, prompt_user, [chunk_image_b64], 0.2
+        )
+    else:
+        result = await asyncio.to_thread(
+            _call_llm_json, prompt_sys, prompt_user, 0.2
+        )
     selected = result.get("selected") or []
     if not isinstance(selected, list):
         return []
@@ -906,14 +944,15 @@ async def agent_select_reference_images(
         if not isinstance(idx, int) or idx < 0 or idx >= len(candidates):
             continue
         img = candidates[idx]
-        # AI가 생성한 짧은 캡션 우선, 없으면 선택 이유 사용
         short_caption = (item.get("caption") or "").strip()
         if not short_caption:
             short_caption = (item.get("reason") or "").strip()
+        target_nid = item.get("target_node_id")
         chosen.append({
             "image_url": img.get("image_url") or "",
             "caption": short_caption,
             "image_id": img.get("image_id") or "",
             "reason": item.get("reason") or "",
+            "target_node_id": target_nid,
         })
     return chosen

@@ -345,6 +345,7 @@ async def process_hwpx_file(
     reference_text: str = "",
     tenant_id: str = "",
     max_concurrent_llm: int = MAX_CONCURRENT_LLM,
+    selected_file_names: list[str] | None = None,
 ) -> str:
     if not report_topic:
         raise ValueError("report_topic is required")
@@ -470,9 +471,16 @@ async def process_hwpx_file(
                     )
                 analysis = _inject_role_pairs(analysis, chunk)
 
-                # 청크별 RAG: memento에서 이 청크에 필요한 참고자료 검색
+                # ── RAG 쿼리 생성 + 이미지 판단을 병렬 실행 ──
                 chunk_reference = reference_text
-                if (tenant_id or "").strip():
+                chunk_ref_images: list[dict] = []
+                image_ref_enabled = IMAGE_REFERENCE_ENABLED and bool((tenant_id or "").strip())
+                has_tenant = bool((tenant_id or "").strip())
+
+                async def _do_rag() -> str:
+                    """RAG 쿼리 생성 → memento 검색 → reference_text 반환."""
+                    if not has_tenant:
+                        return reference_text
                     try:
                         async with sem:
                             rag_queries = await agent_generate_rag_queries(
@@ -484,23 +492,22 @@ async def process_hwpx_file(
                             logger.info("[청크RAG] 쿼리 %d개 생성: %s", len(rag_queries), rag_queries)
                             rag_sources = await search_memento_multi_query(
                                 rag_queries, tenant_id.strip(), top_k=5,
+                                file_names=selected_file_names,
                             )
                             if rag_sources:
                                 rag_text = sources_to_reference_text(rag_sources)
-                                chunk_reference = rag_text + "\n\n---\n\n" + reference_text if reference_text else rag_text
+                                result = rag_text + "\n\n---\n\n" + reference_text if reference_text else rag_text
                                 logger.info("[청크RAG] 참고자료 %d개 추가 (%.1f KB)", len(rag_sources), len(rag_text) / 1024)
+                                return result
                     except Exception as exc:
                         logger.warning("[청크RAG] 실패 (기존 reference_text 사용): %s", exc)
+                    return reference_text
 
-                # ── 이미지 참조: 내부 지식공간의 기존 이미지 첨부 ──
-                chunk_ref_images: list[dict] = []
-                image_ref_enabled = IMAGE_REFERENCE_ENABLED and bool((tenant_id or "").strip())
-                if not image_ref_enabled:
-                    if not IMAGE_REFERENCE_ENABLED:
-                        logger.debug("[이미지참조][청크%d] 비활성화 상태 (IMAGE_REFERENCE_ENABLED=false)", chunk_idx)
-                    elif not (tenant_id or "").strip():
-                        logger.debug("[이미지참조][청크%d] tenant_id 없음 — 건너뜀", chunk_idx)
-                else:
+                async def _do_image_ref() -> list[dict]:
+                    """이미지 참조 판단 → 검색 → 선택 → 삽입대상 결정."""
+                    ref_images: list[dict] = []
+                    if not image_ref_enabled:
+                        return ref_images
                     t_imgref = time.perf_counter()
                     try:
                         # STEP 1: AI가 이 청크에 기존 이미지 첨부가 필요한지 판단
@@ -542,73 +549,60 @@ async def process_hwpx_file(
                                     ),
                                 )
 
-                                # STEP 3: AI가 후보 중 적절한 이미지 선택
+                                # STEP 3: AI가 후보 중 적절한 이미지 선택 + 삽입 노드 결정
                                 logger.info("[이미지참조][청크%d] STEP3 — 후보 중 적절한 이미지 선택 중...", chunk_idx)
                                 async with sem:
                                     selected = await agent_select_reference_images(
                                         candidates, chunk, analysis,
                                         report_topic=report_topic,
+                                        chunk_image_b64=chunk_image_b64,
                                     )
                                 if not selected:
                                     logger.info("[이미지참조][청크%d] STEP3 결과 — 적절한 이미지 없음 (후보 모두 탈락)",
                                                 chunk_idx)
                                 else:
-                                    # STEP 4: 삽입 대상 노드 결정 (큰 셀 또는 본문 우선)
-                                    target_node = None
-                                    _REF_IMG_MIN_W = 80   # mm
-                                    _REF_IMG_MIN_H = 20   # mm
-                                    for item in (analysis.get("nodes") or []):
-                                        cat = (item.get("category") or "").strip().lower()
-                                        action = (item.get("action") or "").lower()
-                                        if cat in ("fill", "placeholder") and action in ("write", "replace"):
-                                            nid = item.get("id")
-                                            node = next((n for n in chunk if n.id == nid), None)
-                                            if not node:
+                                    # STEP 4: LLM이 지정한 target_node_id로 삽입 대상 결정
+                                    node_map_local = {n.id: n for n in chunk}
+                                    async with _used_image_lock:
+                                        for img in selected:
+                                            img_id = img.get("image_id") or img.get("image_url") or ""
+                                            if img_id and img_id in used_image_ids:
+                                                logger.info("[이미지참조][청크%d] 중복 제외: %s", chunk_idx, img_id[:40])
                                                 continue
-                                            # 표 셀이면 크기 체크
-                                            if getattr(node, "type", "") == "table_cell":
-                                                w = getattr(node, "cell_width_mm", 0) or 0
-                                                h = getattr(node, "cell_height_mm", 0) or 0
-                                                if (w > 0 and w < _REF_IMG_MIN_W) or (h > 0 and h < _REF_IMG_MIN_H):
-                                                    continue  # 작은 셀은 건너뜀
-                                            target_node = node
-                                            break
-                                    if not target_node:
-                                        logger.warning("[이미지참조][청크%d] STEP4 — 삽입 대상 노드를 찾지 못함", chunk_idx)
-                                    else:
-                                        # 중복 이미지 제거: 다른 청크에서 이미 선택된 이미지 제외
-                                        async with _used_image_lock:
-                                            deduped = []
-                                            for img in selected:
-                                                img_id = img.get("image_id") or img.get("image_url") or ""
-                                                if img_id and img_id in used_image_ids:
-                                                    logger.info("[이미지참조][청크%d] 중복 제외: %s", chunk_idx, img_id[:40])
-                                                    continue
-                                                deduped.append(img)
-                                                if img_id:
-                                                    used_image_ids.add(img_id)
-                                        # 표 셀이면 이미지 1개만, 본문이면 제한 없음
-                                        max_images = 1 if getattr(target_node, "type", "") == "table_cell" else len(deduped)
-                                        for img in deduped[:max_images]:
-                                            chunk_ref_images.append({
+                                            # LLM이 지정한 노드 사용
+                                            target_nid = img.get("target_node_id")
+                                            target_node = node_map_local.get(target_nid) if target_nid is not None else None
+                                            if target_node is None:
+                                                logger.warning("[이미지참조][청크%d] target_node_id=%s 찾지 못함 — 건너뜀",
+                                                               chunk_idx, target_nid)
+                                                continue
+                                            ref_images.append({
                                                 "node": target_node,
                                                 "image_url": img["image_url"],
                                                 "caption": img.get("caption", ""),
                                             })
-                                        if chunk_ref_images:
-                                            logger.info(
-                                                "[이미지참조][청크%d] STEP4 완료 — %d개 이미지 → node %d 삽입 예정 (중복제외 %d개)",
-                                                chunk_idx, len(chunk_ref_images), target_node.id,
-                                                len(selected) - len(deduped),
-                                            )
-                                        else:
-                                            logger.info("[이미지참조][청크%d] STEP4 — 선택 이미지 모두 중복 → 삽입 없음", chunk_idx)
+                                            if img_id:
+                                                used_image_ids.add(img_id)
+                                    if ref_images:
+                                        target_ids = list({img["node"].id for img in ref_images})
+                                        logger.info(
+                                            "[이미지참조][청크%d] STEP4 완료 — %d개 이미지 → node %s 삽입 예정",
+                                            chunk_idx, len(ref_images), target_ids,
+                                        )
+                                    else:
+                                        logger.info("[이미지참조][청크%d] STEP4 — 유효한 삽입 대상 없음", chunk_idx)
 
                         logger.info("[이미지참조][청크%d] 완료 — 소요 %.1fs, 삽입예정 %d개",
-                                    chunk_idx, time.perf_counter() - t_imgref, len(chunk_ref_images))
+                                    chunk_idx, time.perf_counter() - t_imgref, len(ref_images))
                     except Exception as exc:
                         logger.warning("[이미지참조][청크%d] 예외 발생 — %s (%.1fs)",
                                        chunk_idx, exc, time.perf_counter() - t_imgref)
+                    return ref_images
+
+                # RAG + 이미지참조를 병렬 실행
+                chunk_reference, chunk_ref_images = await asyncio.gather(
+                    _do_rag(), _do_image_ref()
+                )
 
                 # ── ① tables_to_remove 먼저 확정 (fill 전에 처리) ──
                 if isinstance(analysis, dict):
@@ -918,6 +912,7 @@ async def process_hwpx_file(
                 remove_node_ids=delete_node_ids,
                 t_ns=t_ns,
                 image_inserts=image_inserts,
+                header_path=header_path,
             )
 
             # 참조 이미지 삽입 (Gemini 생성과 별개)

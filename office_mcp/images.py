@@ -421,6 +421,63 @@ def _find_center_para_pr_id(header_path: Path) -> str | None:
     return None
 
 
+def generate_images_parallel(
+    image_inserts: list[dict],
+    max_workers: int = 3,
+) -> list[bytes | None]:
+    """이미지 마커 목록에 대해 Gemini 이미지를 병렬 생성한다.
+
+    apply_image_markers_to_section 이전에 미리 호출하여
+    이미지 생성 시간을 다른 작업과 중첩시킬 수 있다.
+
+    Returns:
+        image_inserts와 같은 길이의 리스트. 각 원소는 bytes 또는 None.
+    """
+    result: list[bytes | None] = [None] * len(image_inserts)
+    tasks: list[tuple[int, str, str]] = []
+    for idx, item in enumerate(image_inserts):
+        prompt = (item.get("prompt") or "").strip()
+        ratio = (item.get("ratio") or "").strip()
+        if ratio not in ("16:9", "4:3"):
+            ratio = "16:9"
+        if not prompt:
+            continue
+        tasks.append((idx, prompt, ratio))
+
+    if not tasks:
+        return result
+
+    logger.info("[이미지] Gemini 병렬 생성 시작 %d건 (max=%d)", len(tasks), max_workers)
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+    try:
+        future_map = {
+            executor.submit(generate_image_gemini_bytes, prompt, ratio=ratio): idx
+            for idx, prompt, ratio in tasks
+        }
+        done, not_done = concurrent.futures.wait(
+            future_map.keys(),
+            timeout=GEMINI_IMAGE_TIMEOUT_SECONDS,
+        )
+        for future in done:
+            idx = future_map[future]
+            try:
+                result[idx] = future.result()
+            except Exception as exc:
+                logger.warning("[이미지] 생성 예외 — idx=%d (%s)", idx, exc)
+        if not_done:
+            logger.warning(
+                "[이미지] 생성 타임아웃 — 미완료 %d건 (%.0fs)",
+                len(not_done),
+                GEMINI_IMAGE_TIMEOUT_SECONDS,
+            )
+            for future in not_done:
+                future.cancel()
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    return result
+
+
 def apply_image_markers_to_section(
     tree: ET.ElementTree,
     section_path: str,
@@ -430,6 +487,7 @@ def apply_image_markers_to_section(
     write_back: bool = False,
     image_export_dir: str | None = None,
     export_prefix: str | None = None,
+    pregenerated_bytes: list[bytes | None] | None = None,
 ) -> int:
     if not image_inserts:
         return 0
@@ -448,45 +506,11 @@ def apply_image_markers_to_section(
     local_parent = {c: p for p in root.iter() for c in p}
     center_para_pr_id = _find_center_para_pr_id(extract_dir / "Contents" / "header.xml")
 
-    image_bytes_by_index: list[bytes | None] = [None] * len(image_inserts)
-    tasks: list[tuple[int, str, str]] = []
-    for idx, item in enumerate(image_inserts):
-        prompt = (item.get("prompt") or "").strip()
-        ratio = (item.get("ratio") or "").strip()
-        if ratio not in ("16:9", "4:3"):
-            ratio = "16:9"
-        if not prompt:
-            continue
-        tasks.append((idx, prompt, ratio))
-
-    if tasks:
-        logger.info("[이미지] Gemini 병렬 생성 시작 %d건 (max=3)", len(tasks))
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
-        try:
-            future_map = {
-                executor.submit(generate_image_gemini_bytes, prompt, ratio=ratio): idx
-                for idx, prompt, ratio in tasks
-            }
-            done, not_done = concurrent.futures.wait(
-                future_map.keys(),
-                timeout=GEMINI_IMAGE_TIMEOUT_SECONDS,
-            )
-            for future in done:
-                idx = future_map[future]
-                try:
-                    image_bytes_by_index[idx] = future.result()
-                except Exception as exc:
-                    logger.warning("[이미지] 생성 예외 — idx=%d (%s)", idx, exc)
-            if not_done:
-                logger.warning(
-                    "[이미지] 생성 타임아웃 — 미완료 %d건 (%.0fs)",
-                    len(not_done),
-                    GEMINI_IMAGE_TIMEOUT_SECONDS,
-                )
-                for future in not_done:
-                    future.cancel()
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+    # 사전 생성된 바이트가 있으면 사용, 없으면 직접 생성
+    if pregenerated_bytes is not None and len(pregenerated_bytes) == len(image_inserts):
+        image_bytes_by_index = list(pregenerated_bytes)
+    else:
+        image_bytes_by_index = generate_images_parallel(image_inserts)
 
     for idx, item in enumerate(image_inserts):
         node = item.get("node")

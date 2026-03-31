@@ -274,35 +274,131 @@ def _upload_html_to_storage(file_path: Path, output_name: str) -> str:
 
 
 @mcp.tool
+async def list_reference_documents(
+    query: Annotated[str, Field(description="검색 쿼리 (예: 보고서 주제)")],
+    tenant_id: Annotated[str, Field(description="테넌트 ID")],
+    user_jwt: Annotated[Optional[str], Field(description="사용자 JWT (자동 주입)")] = "",
+    user_uid: Annotated[Optional[str], Field(description="사용자 UID (자동 주입)")] = "",
+    user_email: Annotated[Optional[str], Field(description="사용자 이메일 (자동 주입)")] = "",
+) -> dict:
+    """memento에서 참고 가능한 문서 목록을 검색하여 반환한다.
+
+    HWPX/DOCX 작성 전에 이 도구를 먼저 호출하여 사용자에게 참고 문서를 선택하게 해야 한다.
+    반환된 문서 목록을 사용자에게 보여주고, 사용자가 선택한 문서명 리스트를
+    generate_hwpx 또는 generate_docx의 reference_documents 파라미터로 전달한다.
+    """
+    if not tenant_id or not tenant_id.strip():
+        raise ValueError("tenant_id is required")
+    if not query or not query.strip():
+        raise ValueError("query is required")
+
+    tenant_id = tenant_id.strip()
+    try:
+        from .memento import _list_documents_with_folders
+        doc_details = await _list_documents_with_folders(tenant_id)
+        if not doc_details:
+            return {
+                "documents": [],
+                "total": 0,
+                "message": "등록된 문서가 없습니다.",
+            }
+
+        # 폴더 경로에서 마지막 세그먼트(실제 폴더명)만 추출
+        # 예: "localhost/deep_research_source/유엔진_기업정보" → "유엔진_기업정보"
+        def _leaf_folder(folder_name: str) -> str:
+            if not folder_name:
+                return ""
+            parts = [p for p in folder_name.split("/") if p.strip()]
+            if not parts:
+                return ""
+            return parts[-1]
+
+        return {
+            "documents": doc_details,
+            "total": len(doc_details),
+            "message": f"{len(doc_details)}개의 문서를 찾았습니다. 사용자에게 어떤 문서를 참고할지 선택하게 해주세요.",
+            "user_request_type": "select_items",
+            "question": "제안서 작성에 참고할 문서를 선택해 주세요.",
+            "items": [
+                {
+                    "id": d["file_name"],
+                    "label": d["file_name"],
+                    "description": _leaf_folder(d.get("drive_folder_name", "")),
+                }
+                for d in doc_details
+            ],
+            "allow_multiple": True,
+            "min_select": 1,
+        }
+    except Exception as exc:
+        logger.warning("list_reference_documents 실패: %s", exc)
+        raise ValueError(f"문서 목록 조회 실패: {exc}")
+
+
+@mcp.tool
 async def generate_hwpx(
     template_url: Annotated[str, Field(description="HWPX 템플릿 URL")],
     report_topic: Annotated[str, Field(description="보고서 주제")],
     report_description: Annotated[Optional[str], Field(description="보고서 상세 설명")] = "",
     reference_text: Annotated[Optional[str], Field(description="참고할 텍스트")] = "",
+    reference_documents: Annotated[Optional[str], Field(description="참고할 문서명 리스트 (JSON 배열 문자열, 예: '[\"문서1.pdf\", \"문서2.docx\"]'). list_reference_documents에서 사용자가 선택한 문서명을 전달한다.")] = "",
     tenant_id: Annotated[Optional[str], Field(description="테넌트 ID (memento RAG 검색용)")] = "",
     user_jwt: Annotated[Optional[str], Field(description="사용자 JWT (자동 주입)")] = "",
     user_uid: Annotated[Optional[str], Field(description="사용자 UID (자동 주입)")] = "",
     user_email: Annotated[Optional[str], Field(description="사용자 이메일 (자동 주입)")] = "",
 ) -> dict:
-    """HWPX 템플릿을 채워 스토리지 URL로 반환한다."""
+    """HWPX 템플릿을 채워 스토리지 URL로 반환한다.
+
+    사용자가 list_reference_documents로 선택한 문서가 있으면 reference_documents에 전달한다.
+    reference_documents가 있으면 해당 문서만 참고하여 작성하고, 없으면 memento 전체 검색을 수행한다.
+    """
     if not template_url:
         raise ValueError("template_url is required")
     if not report_topic:
         raise ValueError("report_topic is required")
 
+    import json as _json
+
     report_description = report_description or ""
     reference_text = reference_text or ""
+
+    # reference_documents 파싱 (JSON 배열 문자열 → 리스트)
+    selected_docs: list = []
+    if reference_documents and reference_documents.strip():
+        try:
+            parsed = _json.loads(reference_documents.strip())
+            if isinstance(parsed, list):
+                selected_docs = [str(d).strip() for d in parsed if d]
+            elif isinstance(parsed, str):
+                selected_docs = [parsed.strip()]
+        except _json.JSONDecodeError:
+            # JSON이 아니면 콤마 구분으로 시도
+            selected_docs = [d.strip() for d in reference_documents.split(",") if d.strip()]
+        logger.info("generate_hwpx: 사용자 선택 문서 %d개: %s", len(selected_docs), selected_docs)
 
     # tenant_id가 있으면 memento에서 내부 지식 자료를 검색해 reference_text에 추가
     if (tenant_id or "").strip():
         try:
-            from .memento import search_memento_smart, sources_to_reference_text
+            from .memento import search_memento_smart, search_memento_by_documents, sources_to_reference_text
             logger.info("generate_hwpx: memento RAG 검색 시작 (tenant_id=%s)", tenant_id)
-            memento_sources = await search_memento_smart(
-                query=report_topic,
-                outline=[report_description] if report_description else [report_topic],
-                tenant_id=tenant_id.strip(),
-            )
+
+            if selected_docs:
+                # 사용자가 선택한 문서만 참고
+                memento_sources = await search_memento_by_documents(
+                    query=report_topic,
+                    outline=[report_description] if report_description else [report_topic],
+                    tenant_id=tenant_id.strip(),
+                    file_names=selected_docs,
+                )
+                logger.info("generate_hwpx: 선택 문서 기반 검색 완료 (%d개 소스)", len(memento_sources))
+            else:
+                # 전체 문서에서 스마트 검색
+                memento_sources = await search_memento_smart(
+                    query=report_topic,
+                    outline=[report_description] if report_description else [report_topic],
+                    tenant_id=tenant_id.strip(),
+                )
+
             if memento_sources:
                 memento_text = sources_to_reference_text(memento_sources)
                 if reference_text.strip():
@@ -339,6 +435,7 @@ async def generate_hwpx(
             report_description=report_description,
             reference_text=reference_text,
             tenant_id=(tenant_id or "").strip(),
+            selected_file_names=selected_docs or None,
         )
 
         if DEBUG_OUTPUT_ENABLED:

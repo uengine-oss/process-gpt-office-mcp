@@ -115,6 +115,33 @@ async def _list_documents(tenant_id: str) -> List[str]:
         return []
 
 
+async def _list_documents_with_folders(tenant_id: str) -> List[Dict[str, str]]:
+    """문서 목록을 폴더 정보와 함께 반환한다."""
+    url = f"{_get_memento_url()}/documents/list"
+    params = {"tenant_id": tenant_id, **_get_drive_folder_param()}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+        # file_details가 있으면 사용, 없으면 files로 폴백
+        details = data.get("file_details")
+        if details and isinstance(details, list):
+            return [
+                {
+                    "file_name": str(d.get("file_name", "")),
+                    "drive_folder_name": str(d.get("drive_folder_name", "")),
+                }
+                for d in details
+                if d.get("file_name")
+            ]
+        files = data.get("files") or []
+        return [{"file_name": str(name), "drive_folder_name": ""} for name in files if name]
+    except Exception as exc:
+        logger.warning("documents/list (with folders) 호출 실패: %s", exc)
+        return []
+
+
 async def _get_chunks_metadata(tenant_id: str, file_name: str) -> List[Dict[str, Any]]:
     url = f"{_get_memento_url()}/documents/chunks-metadata"
     params = {"tenant_id": tenant_id, "file_name": file_name, **_get_drive_folder_param()}
@@ -461,6 +488,74 @@ async def search_memento_smart(
     return final_sources
 
 
+async def search_memento_by_documents(
+    query: str,
+    outline: List[str],
+    tenant_id: str,
+    file_names: List[str],
+) -> List[Dict[str, Any]]:
+    """사용자가 선택한 특정 문서들만 대상으로 스마트 검색을 수행한다.
+
+    search_memento_smart와 동일한 로직이지만 Step 1~2(문서 목록 조회+LLM 선택)를
+    건너뛰고, 사용자가 직접 선택한 file_names로 바로 청크 검색을 수행한다.
+    """
+    if not tenant_id or not file_names:
+        return []
+
+    logger.info(
+        "search_memento_by_documents 시작 (query=%s, tenant_id=%s, files=%s)",
+        query, tenant_id, file_names,
+    )
+
+    max_total_chunks = 30
+    precise_sources: List[Dict[str, Any]] = []
+
+    for file_name in file_names:
+        if len(precise_sources) >= max_total_chunks:
+            break
+        chunks_metadata = await _get_chunks_metadata(tenant_id, file_name)
+        if not chunks_metadata:
+            logger.info("chunks-metadata 없음 (%s) → 건너뜀", file_name)
+            continue
+
+        selected_indices = await asyncio.to_thread(
+            _select_chunks_with_llm, outline, chunks_metadata, file_name
+        )
+        if not selected_indices:
+            # 청크 선택 실패 시 전체 청크 사용 (최대 10개)
+            selected_indices = [
+                c["chunk_index"] for c in chunks_metadata
+                if c.get("chunk_index") is not None
+            ][:10]
+
+        logger.info("LLM 선택 chunk_indices (%s): %s", file_name, selected_indices)
+
+        doc_sources = await _retrieve_by_indices(tenant_id, file_name, selected_indices)
+        if doc_sources:
+            precise_sources.extend(doc_sources)
+
+    if not precise_sources:
+        logger.info("선택 문서에서 청크 조회 결과 없음")
+        return []
+
+    logger.info("1차 선택(title 기반): %d 청크", len(precise_sources))
+
+    # content 기반 최종 선택
+    final_sources = await asyncio.to_thread(
+        _final_review_chunks_with_llm, query, outline, precise_sources, max_total_chunks
+    )
+
+    # 내부 전용 키 제거
+    for s in final_sources:
+        s.pop("_chunk_index", None)
+        s.pop("_file_name", None)
+        s.pop("_drive_folder_name", None)
+        s.pop("_section_title", None)
+
+    logger.info("search_memento_by_documents 완료: 최종 %d 청크", len(final_sources))
+    return final_sources
+
+
 def sources_to_reference_text(sources: List[Dict[str, Any]]) -> str:
     """소스 목록을 reference_text 문자열로 변환한다.
 
@@ -553,23 +648,41 @@ async def search_memento_multi_query(
     queries: List[str],
     tenant_id: str,
     top_k: int = 5,
+    file_names: List[str] | None = None,
 ) -> List[Dict[str, Any]]:
     """여러 쿼리로 memento를 검색하고 중복 제거해 반환한다.
 
     각 쿼리별 top_k개를 가져온 뒤 content 기준으로 중복을 제거한다.
+    file_names가 주어지면 해당 문서에서 나온 결과만 반환한다.
     """
     if not tenant_id or not queries:
         return []
 
-    logger.info("[청크RAG] %d개 쿼리로 memento 검색 시작 (top_k=%d)", len(queries), top_k)
+    filter_desc = ""
+    if file_names:
+        filter_desc = f", 문서필터={len(file_names)}개"
+    logger.info("[청크RAG] %d개 쿼리로 memento 검색 시작 (top_k=%d%s)", len(queries), top_k, filter_desc)
 
     # 모든 쿼리를 병렬로 검색
     tasks = [_broad_search(q, tenant_id, top_k=top_k) for q in queries]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
+    # 파일명 필터 준비 (부분 매칭: 선택 문서명이 결과 파일명에 포함되면 통과)
+    def _matches_filter(src: Dict[str, Any]) -> bool:
+        if not file_names:
+            return True
+        src_file = src.get("_file_name") or ""
+        if not src_file:
+            return False
+        for selected in file_names:
+            if selected in src_file or src_file in selected:
+                return True
+        return False
+
     # 결과 합산 + 중복 제거 (content 해시 기준)
     seen_contents: set = set()
     unique_sources: List[Dict[str, Any]] = []
+    filtered_count = 0
     for i, result in enumerate(results):
         if isinstance(result, Exception):
             logger.warning("[청크RAG] 쿼리 %d 실패: %s", i, result)
@@ -578,11 +691,17 @@ async def search_memento_multi_query(
             content = (src.get("content") or "").strip()
             if not content:
                 continue
+            if not _matches_filter(src):
+                filtered_count += 1
+                continue
             content_key = content[:200]  # 앞 200자로 중복 판별
             if content_key in seen_contents:
                 continue
             seen_contents.add(content_key)
             unique_sources.append(src)
 
-    logger.info("[청크RAG] 검색 완료: 총 %d개 (중복제거 후)", len(unique_sources))
+    if filtered_count:
+        logger.info("[청크RAG] 검색 완료: 총 %d개 (중복제거 후, 문서필터로 %d개 제외)", len(unique_sources), filtered_count)
+    else:
+        logger.info("[청크RAG] 검색 완료: 총 %d개 (중복제거 후)", len(unique_sources))
     return unique_sources
