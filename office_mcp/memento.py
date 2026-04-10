@@ -14,19 +14,20 @@ import httpx
 
 from .agent.agent import _call_llm_json
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("process-gpt-office-mcp")
 
 # memento 동시 요청 제한 (과도한 병렬 요청으로 인한 타임아웃 방지)
 _MEMENTO_SEM = asyncio.Semaphore(5)
 
 
 def _get_memento_url() -> str:
-    return os.getenv("MEMENTO_SERVICE_URL", "http://memento-service:8005")
+    from .config import MEMENTO_SERVICE_URL
+    return MEMENTO_SERVICE_URL
 
 
 def _get_drive_folder_param() -> Dict[str, str]:
-    folder_id = (os.getenv("MEMENTO_DRIVE_FOLDER_ID", "") or "").strip()
-    return {"drive_folder_id": folder_id} if folder_id else {}
+    from .config import MEMENTO_DRIVE_FOLDER_ID
+    return {"drive_folder_id": MEMENTO_DRIVE_FOLDER_ID} if MEMENTO_DRIVE_FOLDER_ID else {}
 
 
 # ---------------------------------------------------------------------------

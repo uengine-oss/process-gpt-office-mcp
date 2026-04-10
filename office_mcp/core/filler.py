@@ -6,10 +6,235 @@ from xml.etree import ElementTree as ET
 from ..models import TextNode
 from ..images import apply_image_markers_to_section
 from .parser import collect_runs_and_texts
-from .xml_utils import find_parent, tag, register_namespaces
+from .xml_utils import find_parent, tag, ns, register_namespaces
 
 
 logger = logging.getLogger("process-gpt-office-mcp")
+
+# ── 각주 마커: [FN:본문텍스트|각주설명] ──
+_FOOTNOTE_RE = re.compile(r"\[FN:([^|]+)\|([^\]]+)\]")
+
+# 전역 각주 카운터 (섹션 내 자동번호)
+_footnote_counter = 0
+
+
+def _reset_footnote_counter() -> None:
+    global _footnote_counter
+    _footnote_counter = 0
+
+
+def _next_footnote_num() -> int:
+    global _footnote_counter
+    _footnote_counter += 1
+    return _footnote_counter
+
+
+def _parse_footnote_markers(text: str) -> tuple[list[dict], str]:
+    """텍스트에서 [FN:본문텍스트|각주설명] 마커를 추출한다.
+
+    Returns:
+        (markers, cleaned_text)
+        markers: [{"anchor": "IP", "note": "Indonesia Power: PLN 자회사", "pos": 12}, ...]
+        cleaned_text: 마커가 제거되고 본문텍스트만 남은 텍스트
+    """
+    markers: list[dict] = []
+    offset = 0
+    cleaned = text
+
+    for m in _FOOTNOTE_RE.finditer(text):
+        anchor = m.group(1).strip()
+        note = m.group(2).strip()
+        # cleaned에서의 위치 계산 (이전 마커 제거로 인한 offset 보정)
+        clean_pos = m.start() - offset
+        markers.append({"anchor": anchor, "note": note, "pos": clean_pos})
+        # 마커를 anchor 텍스트로 교체
+        cleaned = cleaned[:clean_pos] + anchor + cleaned[clean_pos + len(m.group(0)):]
+        offset += len(m.group(0)) - len(anchor)
+
+    return markers, cleaned
+
+
+def _find_footnote_style(header_path: str | None) -> tuple[str, str, str]:
+    """header.xml에서 '각주' 스타일의 charPrIDRef, paraPrIDRef, styleID를 찾는다.
+
+    Returns:
+        (charpr_id, parapr_id, style_id) — 못 찾으면 ("0", "0", "0")
+    """
+    if not header_path or not os.path.exists(header_path):
+        return ("0", "0", "0")
+    tree = ET.parse(header_path)
+    root = tree.getroot()
+    for elem in root.iter():
+        if tag(elem) == "style" and elem.get("name") == "각주":
+            charpr = elem.get("charPrIDRef", "0")
+            parapr = elem.get("paraPrIDRef", "0")
+            sid = elem.get("id", "0")
+            logger.info("[각주스타일] '각주' 스타일 발견: styleID=%s, charPrIDRef=%s, paraPrIDRef=%s", sid, charpr, parapr)
+            return (charpr, parapr, sid)
+    logger.warning("[각주스타일] '각주' 스타일 없음 → 기본값 사용")
+    return ("0", "0", "0")
+
+
+def _build_footnote_elements(
+    note_text: str,
+    footnote_num: int,
+    p_ns: str,
+    charpr_id: str = "0",
+    parapr_id: str = "0",
+    style_id: str = "0",
+) -> ET.Element:
+    """HWPX <footNote> XML 엘리먼트를 생성한다.
+
+    구조:
+    <footNote id="">
+      <subList ...>
+        <p ...>
+          <run charPrIDRef="...">
+            <ctrl>
+              <autoNum num="N" numType="FOOTNOTE">
+                <autoNumFormat type="DIGIT" suffixChar=")" .../>
+              </autoNum>
+            </ctrl>
+            <t> 각주 텍스트</t>
+          </run>
+          <linesegarray>
+            <lineseg .../>
+          </linesegarray>
+        </p>
+      </subList>
+    </footNote>
+    """
+    fn = ET.Element(f"{p_ns}footNote")
+    fn.set("id", "")
+
+    sub = ET.SubElement(fn, f"{p_ns}subList")
+    for attr, val in [
+        ("id", ""), ("textDirection", "HORIZONTAL"), ("lineWrap", "BREAK"),
+        ("vertAlign", "TOP"), ("linkListIDRef", "0"), ("linkListNextIDRef", "0"),
+        ("textWidth", "0"), ("textHeight", "0"), ("hasTextRef", "0"), ("hasNumRef", "0"),
+    ]:
+        sub.set(attr, val)
+
+    p = ET.SubElement(sub, f"{p_ns}p")
+    p.set("id", "2147483648")
+    p.set("paraPrIDRef", parapr_id)
+    p.set("styleIDRef", style_id)
+    for attr in ("pageBreak", "columnBreak", "merged"):
+        p.set(attr, "0")
+
+    run = ET.SubElement(p, f"{p_ns}run")
+    run.set("charPrIDRef", charpr_id)
+
+    ctrl = ET.SubElement(run, f"{p_ns}ctrl")
+    auto_num = ET.SubElement(ctrl, f"{p_ns}autoNum")
+    auto_num.set("num", str(footnote_num))
+    auto_num.set("numType", "FOOTNOTE")
+    auto_fmt = ET.SubElement(auto_num, f"{p_ns}autoNumFormat")
+    auto_fmt.set("type", "DIGIT")
+    auto_fmt.set("userChar", "")
+    auto_fmt.set("prefixChar", "")
+    auto_fmt.set("suffixChar", ")")
+    auto_fmt.set("supscript", "0")
+
+    t = ET.SubElement(run, f"{p_ns}t")
+    t.text = f" {note_text}"
+
+    lsa = ET.SubElement(p, f"{p_ns}linesegarray")
+    ls = ET.SubElement(lsa, f"{p_ns}lineseg")
+    for attr, val in [
+        ("textpos", "0"), ("vertpos", "0"), ("vertsize", "1100"),
+        ("textheight", "1100"), ("baseline", "935"), ("spacing", "220"),
+        ("horzpos", "0"), ("horzsize", "48188"), ("flags", "393216"),
+    ]:
+        ls.set(attr, val)
+
+    return fn
+
+
+def _inject_footnotes_into_run(
+    target_run: ET.Element,
+    new_text: str,
+    fn_markers: list[dict],
+    parent_map: dict,
+    t_ns: str = "",
+    header_path: str | None = None,
+) -> str:
+    """run 엘리먼트에 각주를 삽입하고 본문 텍스트를 반환한다.
+
+    각주가 있는 경우, 텍스트를 anchor 기준으로 분할하여
+    각 anchor 뒤에 <ctrl><footNote> 구조를 삽입한다.
+    """
+    if not fn_markers:
+        return new_text
+
+    p_ns_str = ns(target_run)
+
+    # header.xml에서 "각주" 스타일 조회 → 각주 내부에 적용
+    fn_charpr, fn_parapr, fn_style = _find_footnote_style(header_path)
+
+    # 기존 run 내용 비우기 (t 엘리먼트 제거)
+    t_tag_name = f"{t_ns}t" if t_ns else "t"
+    for child in list(target_run):
+        if tag(child) == "t":
+            target_run.remove(child)
+
+    # 텍스트를 anchor 위치 기준으로 분할하여 [텍스트, anchor, 텍스트, anchor, ...] 생성
+    # markers는 pos 기준 정렬
+    sorted_markers = sorted(fn_markers, key=lambda m: m["pos"])
+
+    # 마커가 이미 제거된 cleaned_text 기반 → anchor 위치로 분할
+    cleaned = new_text
+    segments: list[dict] = []  # {"type": "text"|"footnote", "text": ..., "note": ...}
+    last_pos = 0
+
+    for marker in sorted_markers:
+        anchor = marker["anchor"]
+        # cleaned 텍스트에서 anchor 위치 찾기
+        pos = cleaned.find(anchor, last_pos)
+        if pos < 0:
+            continue
+
+        # anchor 앞 텍스트
+        if pos > last_pos:
+            segments.append({"type": "text", "text": cleaned[last_pos:pos]})
+
+        # anchor + 각주
+        segments.append({
+            "type": "footnote",
+            "text": anchor,
+            "note": marker["note"],
+        })
+        last_pos = pos + len(anchor)
+
+    # 남은 텍스트
+    if last_pos < len(cleaned):
+        segments.append({"type": "text", "text": cleaned[last_pos:]})
+
+    # segments를 run 내에 t + ctrl(footNote) 형태로 삽입
+    for seg in segments:
+        if seg["type"] == "text":
+            t_elem = ET.SubElement(target_run, t_tag_name)
+            t_elem.text = seg["text"]
+        elif seg["type"] == "footnote":
+            # anchor 텍스트
+            t_elem = ET.SubElement(target_run, t_tag_name)
+            t_elem.text = seg["text"]
+            # 각주 구조 (header.xml의 "각주" 스타일 사용)
+            fn_num = _next_footnote_num()
+            ctrl = ET.SubElement(target_run, f"{p_ns_str}ctrl")
+            fn_elem = _build_footnote_elements(
+                note_text=seg["note"],
+                footnote_num=fn_num,
+                p_ns=p_ns_str,
+                charpr_id=fn_charpr,
+                parapr_id=fn_parapr,
+                style_id=fn_style,
+            )
+            ctrl.append(fn_elem)
+
+    logger.info("[각주] %d개 각주 삽입 (node run)", len(fn_markers))
+    return cleaned
+
 
 # ── 불릿 패턴: 내어쓰기(hanging indent)를 적용할 줄 패턴 ──
 _BULLET_CHARS = set("ㅇ○●◦▪▸▹–—•·※☞◆◇■□▶►★☆")
@@ -237,6 +462,8 @@ def apply_fills(
     header_path: str | None = None,
     pregenerated_image_bytes: list[bytes | None] | None = None,
 ) -> None:
+    _reset_footnote_counter()  # 섹션마다 각주 번호 리셋
+
     fill_map = {
         f["id"]: f["new_text"]
         for f in fills
@@ -414,6 +641,9 @@ def apply_fills(
         prefix = _leading_ws(node)
         if prefix:
             new_text = f"{prefix}{new_text}"
+
+        # ── 각주 마커 파싱: [FN:본문텍스트|각주설명] ──
+        fn_markers, new_text = _parse_footnote_markers(new_text)
 
         # 원본 텍스트와 동일하면 XML 구조 보존을 위해 건너뜀 (공백 무시 비교)
         import re as _re
@@ -598,8 +828,14 @@ def apply_fills(
             logger.info("[fill] node %d: 표셀 %d줄 → %d개 문단에 분배",
                         node.id, len(dist_lines), min(len(dist_lines), len(para_list)))
         elif node.t_elements:
-            node.t_elements[0].text = new_text
-            logger.info("[fill] node %d: t_elements[0] 텍스트 교체 (%d자, t_elements=%d개)", node.id, len(new_text), len(node.t_elements))
+            # 각주 마커가 있으면 run 구조를 재구성
+            if fn_markers:
+                _inject_footnotes_into_run(target_run, new_text, fn_markers, parent_map, t_ns, header_path=header_path)
+                logger.info("[fill] node %d: t_elements 교체 + 각주 %d개 삽입 (%d자)",
+                            node.id, len(fn_markers), len(new_text))
+            else:
+                node.t_elements[0].text = new_text
+                logger.info("[fill] node %d: t_elements[0] 텍스트 교체 (%d자, t_elements=%d개)", node.id, len(new_text), len(node.t_elements))
             for extra_t in node.t_elements[1:]:
                 extra_run = find_parent(extra_t, parent_map, "run")
                 if extra_run is not None:
@@ -612,10 +848,14 @@ def apply_fills(
                 _remove_linesegarray(extra_p)
         elif node.run_elements:
             t_tag = f"{t_ns}t" if t_ns else "t"
-            new_t = ET.Element(t_tag)
-            target_run.insert(0, new_t)
-            new_t.text = new_text
-            logger.info("[fill] node %d: t 요소 새로 생성 (run에 삽입, %d자)", node.id, len(new_text))
+            if fn_markers:
+                _inject_footnotes_into_run(target_run, new_text, fn_markers, parent_map, t_ns, header_path=header_path)
+                logger.info("[fill] node %d: run에 각주 %d개 삽입 (%d자)", node.id, len(fn_markers), len(new_text))
+            else:
+                new_t = ET.Element(t_tag)
+                target_run.insert(0, new_t)
+                new_t.text = new_text
+                logger.info("[fill] node %d: t 요소 새로 생성 (run에 삽입, %d자)", node.id, len(new_text))
 
     _remove_instruction_content(tree.getroot())
 

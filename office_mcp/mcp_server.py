@@ -75,8 +75,7 @@ def _setup_logging() -> logging.Logger:
 
 logger = _setup_logging()
 DEBUG_OUTPUT_PATH = Path(__file__).resolve().parent / DEBUG_OUTPUT_DIR
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
+from .config import SUPABASE_URL, SUPABASE_KEY
 SUPABASE_BUCKET = "deep_research_files"
 HWPX_CONTENT_TYPE = "application/vnd.hancom.hwpx"
 HTML_CONTENT_TYPE = "text/html; charset=utf-8"
@@ -283,7 +282,9 @@ async def list_reference_documents(
 ) -> dict:
     """memento에서 참고 가능한 문서 목록을 검색하여 반환한다.
 
-    HWPX/DOCX 작성 전에 이 도구를 먼저 호출하여 사용자에게 참고 문서를 선택하게 해야 한다.
+    [필수 선행 도구] generate_hwpx / generate_docx 호출 전에 반드시 이 도구를 먼저 호출해야 한다.
+    사용자가 HWPX/DOCX 파일 작성을 요청하면 이 도구를 즉시 호출하고, 반환된 JSON을 그대로 응답에 포함하여 반환한다.
+    사용자가 문서를 선택한 후에만 generate_hwpx / generate_docx를 호출한다.
     반환된 문서 목록을 사용자에게 보여주고, 사용자가 선택한 문서명 리스트를
     generate_hwpx 또는 generate_docx의 reference_documents 파라미터로 전달한다.
     """
@@ -329,6 +330,20 @@ async def list_reference_documents(
             ],
             "allow_multiple": True,
             "min_select": 1,
+            "image_options": [
+                {
+                    "id": "image_generation",
+                    "label": "Gemini 이미지 생성",
+                    "description": "AI가 문서 내용에 맞는 이미지를 자동으로 생성하여 삽입합니다",
+                    "default": True,
+                },
+                {
+                    "id": "image_reference",
+                    "label": "Memento 이미지 참조",
+                    "description": "지식 베이스에서 관련 이미지를 검색하여 삽입합니다",
+                    "default": True,
+                },
+            ],
         }
     except Exception as exc:
         logger.warning("list_reference_documents 실패: %s", exc)
@@ -343,14 +358,22 @@ async def generate_hwpx(
     reference_text: Annotated[Optional[str], Field(description="참고할 텍스트")] = "",
     reference_documents: Annotated[Optional[str], Field(description="참고할 문서명 리스트 (JSON 배열 문자열, 예: '[\"문서1.pdf\", \"문서2.docx\"]'). list_reference_documents에서 사용자가 선택한 문서명을 전달한다.")] = "",
     tenant_id: Annotated[Optional[str], Field(description="테넌트 ID (memento RAG 검색용)")] = "",
+    image_generation_enabled: Annotated[Optional[bool], Field(description="Gemini 이미지 생성 사용 여부. 사용자가 이미지 생성을 원하면 true, 원하지 않으면 false. 미지정 시 서버 기본값 사용.")] = None,
+    image_reference_enabled: Annotated[Optional[bool], Field(description="Memento 이미지 참조 사용 여부. 사용자가 지식 베이스 이미지 참조를 원하면 true, 원하지 않으면 false. 미지정 시 서버 기본값 사용.")] = None,
+    source_chunks_json: Annotated[Optional[str], Field(description="소스 파일에서 추출한 참고자료 청크 리스트 (JSON 배열). 각 청크는 {file_name, chunk_index, original_text, summary} 구조. 프로세스 소스에서 파싱된 참고자료를 템플릿 채우기에 활용한다.")] = "",
     user_jwt: Annotated[Optional[str], Field(description="사용자 JWT (자동 주입)")] = "",
     user_uid: Annotated[Optional[str], Field(description="사용자 UID (자동 주입)")] = "",
     user_email: Annotated[Optional[str], Field(description="사용자 이메일 (자동 주입)")] = "",
 ) -> dict:
     """HWPX 템플릿을 채워 스토리지 URL로 반환한다.
 
-    사용자가 list_reference_documents로 선택한 문서가 있으면 reference_documents에 전달한다.
+    [사전 조건] tenant_id가 있는 경우 이 도구를 호출하기 전에 반드시 list_reference_documents를 먼저 호출해야 한다.
+    list_reference_documents → 사용자 문서 선택 확인 → 이 도구 호출 순서를 반드시 지킨다.
+    사용자가 "전부 참고해서 작성해줘" 또는 "참고 문서 없이 작성해 주세요"라고 한 경우에는 reference_documents 없이 바로 호출한다.
+
     reference_documents가 있으면 해당 문서만 참고하여 작성하고, 없으면 memento 전체 검색을 수행한다.
+    사용자가 "참고 문서 없이 작성해 주세요"라고 하면 reference_documents를 비워두고 호출한다.
+    사용자가 이미지 생성/참조 옵션을 선택한 경우 image_generation_enabled, image_reference_enabled에 전달한다.
     """
     if not template_url:
         raise ValueError("template_url is required")
@@ -412,6 +435,18 @@ async def generate_hwpx(
             logger.warning("generate_hwpx: memento 검색 실패 (무시하고 계속 진행): %s", exc)
     else:
         logger.info("generate_hwpx: tenant_id 없음 → memento 검색 건너뜀")
+
+    # source_chunks_json 파싱 (프로세스 소스에서 온 참고자료 청크)
+    source_chunks: list = []
+    if source_chunks_json and source_chunks_json.strip():
+        try:
+            parsed_chunks = _json.loads(source_chunks_json.strip())
+            if isinstance(parsed_chunks, list):
+                source_chunks = parsed_chunks
+                logger.info("generate_hwpx: 소스 참고자료 청크 %d개 수신", len(source_chunks))
+        except _json.JSONDecodeError:
+            logger.warning("generate_hwpx: source_chunks_json 파싱 실패")
+
     template_name = _safe_filename_from_url(template_url)
     base_name = _build_output_basename(report_topic)
     output_name = f"{base_name}.hwpx"
@@ -436,6 +471,9 @@ async def generate_hwpx(
             reference_text=reference_text,
             tenant_id=(tenant_id or "").strip(),
             selected_file_names=selected_docs or None,
+            image_generation_enabled=image_generation_enabled,
+            image_reference_enabled=image_reference_enabled,
+            source_chunks=source_chunks or None,
         )
 
         if DEBUG_OUTPUT_ENABLED:
@@ -658,7 +696,11 @@ async def generate_docx(
     user_uid: Annotated[Optional[str], Field(description="사용자 UID (자동 주입)")] = "",
     user_email: Annotated[Optional[str], Field(description="사용자 이메일 (자동 주입)")] = "",
 ) -> dict:
-    """DOCX 템플릿을 LLM으로 채워 스토리지 URL로 반환한다."""
+    """DOCX 템플릿을 LLM으로 채워 스토리지 URL로 반환한다.
+
+    [사전 조건] tenant_id가 있는 경우 이 도구를 호출하기 전에 반드시 list_reference_documents를 먼저 호출해야 한다.
+    사용자가 문서를 선택한 후에만 이 도구를 호출한다.
+    """
     if not template_url:
         raise ValueError("template_url is required")
     if not query:
@@ -938,7 +980,8 @@ async def save_docx_from_html(
 @mcp.tool
 async def generate_slides(
     report_markdown: Annotated[Optional[str], Field(description="보고서 마크다운 (이 값이 있으면 markdown 기반으로 슬라이드 생성)")] = "",
-    research_goal: Annotated[Optional[str], Field(description="리서치 목표 (report_markdown 없을 때 사용)")] = "",
+    hwpx_html_url: Annotated[Optional[str], Field(description="이전에 generate_hwpx로 생성한 결과의 html_url. 이 값이 있으면 해당 문서 내용을 읽어 슬라이드를 생성하며 report_markdown보다 우선 적용된다.")] = "",
+    research_goal: Annotated[Optional[str], Field(description="리서치 목표 (report_markdown/hwpx_html_url 없을 때 사용)")] = "",
     outline_json: Annotated[Optional[str], Field(description="개요 목록 (JSON list[str], research_goal 모드에서 사용)")] = "",
     sources_json: Annotated[Optional[str], Field(description="소스 목록 (JSON list[dict], research_goal 모드에서 사용)")] = "",
     deck_title: Annotated[Optional[str], Field(description="덱 제목")] = "",
@@ -950,13 +993,35 @@ async def generate_slides(
     user_uid: Annotated[Optional[str], Field(description="사용자 UID (자동 주입)")] = "",
     user_email: Annotated[Optional[str], Field(description="사용자 이메일 (자동 주입)")] = "",
 ) -> dict:
-    """슬라이드 마크다운과 이미지를 생성해 반환한다."""
+    """슬라이드 마크다운과 이미지를 생성해 반환한다.
+
+    generate_hwpx로 완성된 문서를 슬라이드로 변환하려면 해당 결과의 html_url을 hwpx_html_url에 전달한다.
+    report_markdown을 직접 가진 경우에는 그것을 사용하고, 아무것도 없으면 research_goal로 새로 리서치한다.
+    우선순위: hwpx_html_url > report_markdown > research_goal
+    """
     import asyncio as _asyncio
     import json as _json
     import uuid as _uuid
 
     rid = report_id or _uuid.uuid4().hex
     sc = int(slide_count) if slide_count else None
+
+    # hwpx_html_url이 있으면 HTML에서 텍스트를 추출해 report_markdown으로 사용
+    if hwpx_html_url and hwpx_html_url.strip():
+        try:
+            from bs4 import BeautifulSoup
+            resp = requests.get(hwpx_html_url.strip(), timeout=30)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+            # 불필요한 태그 제거
+            for tag in soup(["script", "style", "head"]):
+                tag.decompose()
+            report_markdown = soup.get_text(separator="\n", strip=True)
+            logger.info("generate_slides: hwpx_html_url에서 텍스트 추출 완료 (len=%d)", len(report_markdown))
+        except Exception as exc:
+            logger.warning("generate_slides: hwpx_html_url 텍스트 추출 실패: %s", exc)
+            if not report_markdown:
+                raise ValueError(f"hwpx_html_url 처리 실패: {exc}")
 
     if report_markdown:
         slide_md_raw = await _asyncio.to_thread(build_slide_markdown, report_markdown, sc, style or None)

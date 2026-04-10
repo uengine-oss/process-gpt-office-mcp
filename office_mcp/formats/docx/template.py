@@ -22,7 +22,7 @@ from supabase import create_client
 from ...images import generate_image_gemini
 from ...config import IMAGE_GENERATION_ENABLED
 
-logger = logging.getLogger("office-mcp-docx-template")
+logger = logging.getLogger("process-gpt-office-mcp")
 
 PLACEHOLDER_PATTERN = re.compile(r"\[[^\[\]]+?\]")
 HEADING_NUMBER_PATTERN = re.compile(r"^\s*\d+(\.\d+)*\s+")
@@ -34,11 +34,10 @@ STORAGE_BUCKET = "deep_research_files"
 
 
 def _get_supabase():
-    url = os.environ.get("SUPABASE_URL", "").strip()
-    key = os.environ.get("SUPABASE_KEY", "").strip()
-    if not url or not key:
+    from ...config import SUPABASE_URL, SUPABASE_KEY
+    if not SUPABASE_URL or not SUPABASE_KEY:
         raise RuntimeError("SUPABASE_URL 또는 SUPABASE_KEY가 설정되지 않았습니다.")
-    return create_client(url, key)
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 def _extract_public_url(response: Any) -> Optional[str]:
@@ -516,7 +515,8 @@ def upload_docx_to_storage(file_path: Path, storage_path: str) -> Optional[str]:
     except Exception as e:
         logger.error("storage 업로드 실패: %s", e)
         return None
-    base_url = os.environ.get("SUPABASE_URL", "").rstrip("/")
+    from ...config import SUPABASE_URL as _sb_url
+    base_url = _sb_url.rstrip("/")
     if base_url:
         return f"{base_url}/storage/v1/object/public/{STORAGE_BUCKET}/{quote(safe_path, safe='/-_.')}"
     return None
@@ -536,7 +536,8 @@ def _upload_image_to_storage(file_path: Path, report_id: str, filename: str) -> 
             return url
     except Exception as e:
         logger.error("image 업로드 실패: %s", e)
-    base_url = os.environ.get("SUPABASE_URL", "").rstrip("/")
+    from ...config import SUPABASE_URL as _sb_url
+    base_url = _sb_url.rstrip("/")
     if base_url:
         return f"{base_url}/storage/v1/object/public/{STORAGE_BUCKET}/{quote(storage_path, safe='/-_.')}"
     return None

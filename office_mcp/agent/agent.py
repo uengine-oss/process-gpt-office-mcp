@@ -1,36 +1,16 @@
 import asyncio
 import json
 import logging
-import re
 import time
 from typing import Any
 
-from ..config import (
-    MODEL_NAME, LLM_PROVIDER,
-    OPENAI_API_KEY, OPENAI_TIMEOUT_SECONDS,
-    GOOGLE_API_KEY,
-)
 from ..models import TextNode, TableSummary
+from .llm_provider import create_provider
 
 logger = logging.getLogger("process-gpt-office-mcp")
 
-# ── Provider 초기화 ──
-_openai_client = None
-_gemini_client = None
-
-if LLM_PROVIDER == "gemini":
-    if not GOOGLE_API_KEY:
-        raise RuntimeError("LLM_PROVIDER=gemini이지만 GOOGLE_API_KEY가 없습니다")
-    from google import genai
-    from google.genai import types as genai_types
-    _gemini_client = genai.Client(api_key=GOOGLE_API_KEY)
-    logger.info("[LLM] Provider=gemini, model=%s", MODEL_NAME)
-else:
-    if not OPENAI_API_KEY:
-        raise RuntimeError("LLM_PROVIDER=openai이지만 OPENAI_API_KEY가 없습니다")
-    from openai import OpenAI
-    _openai_client = OpenAI(api_key=OPENAI_API_KEY, timeout=OPENAI_TIMEOUT_SECONDS)
-    logger.info("[LLM] Provider=openai, model=%s", MODEL_NAME)
+# ── Provider 초기화 (LLM_PROVIDER 설정에 따라 자동 선택) ──
+_provider = create_provider()
 
 
 _CHUNK_PLAN_SCHEMA = {
@@ -61,135 +41,12 @@ _CHUNK_PLAN_SCHEMA = {
 }
 
 
-_MAX_RETRIES = 3
-
-
-def _extract_json_from_text(text: str) -> str:
-    """Gemini 응답에서 JSON 블록을 추출한다 (```json ... ``` 또는 전체 텍스트)."""
-    # ```json ... ``` 패턴
-    m = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
-    if m:
-        return m.group(1).strip()
-    # 전체가 JSON이면 그대로
-    text = text.strip()
-    if text.startswith("{"):
-        return text
-    return text
-
-
-# ── OpenAI 호출 ──
-
-def _call_openai_json(prompt_sys: str, prompt_user: str, temperature: float, user_content=None) -> dict:
-    started = time.perf_counter()
-    messages = [{"role": "system", "content": prompt_sys}]
-    if user_content:
-        messages.append({"role": "user", "content": user_content})
-    else:
-        messages.append({"role": "user", "content": prompt_user})
-
-    last_exc = None
-    for attempt in range(1, _MAX_RETRIES + 1):
-        try:
-            resp = _openai_client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=messages,
-                temperature=temperature,
-                response_format={"type": "json_object"},
-            )
-            elapsed = time.perf_counter() - started
-            content = resp.choices[0].message.content or "{}"
-            data = json.loads(content)
-            data["_elapsed_s"] = round(elapsed, 3)
-            return data
-        except Exception as exc:
-            last_exc = exc
-            logger.warning("[LLM RETRY] attempt=%d/%d error=%s", attempt, _MAX_RETRIES, exc)
-            if attempt < _MAX_RETRIES:
-                time.sleep(1)
-    raise last_exc
-
-
-def _call_openai_text(prompt_sys: str, prompt_user: str, temperature: float) -> str:
-    started = time.perf_counter()
-    resp = _openai_client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[
-            {"role": "system", "content": prompt_sys},
-            {"role": "user", "content": prompt_user},
-        ],
-        temperature=temperature,
-    )
-    elapsed = time.perf_counter() - started
-    return resp.choices[0].message.content or ""
-
-
-# ── Gemini 호출 ──
-
-def _call_gemini_json(prompt_sys: str, prompt_user: str, temperature: float, images_b64: list[str] | None = None) -> dict:
-    started = time.perf_counter()
-
-    contents = []
-    if images_b64:
-        import base64
-        contents.append(prompt_user)
-        for img in images_b64:
-            img_bytes = base64.b64decode(img)
-            contents.append(genai_types.Part.from_bytes(data=img_bytes, mime_type="image/png"))
-    else:
-        contents.append(prompt_user)
-
-    config = genai_types.GenerateContentConfig(
-        system_instruction=prompt_sys,
-        temperature=temperature,
-        response_mime_type="application/json",
-    )
-
-    last_exc = None
-    for attempt in range(1, _MAX_RETRIES + 1):
-        try:
-            resp = _gemini_client.models.generate_content(
-                model=MODEL_NAME,
-                contents=contents,
-                config=config,
-            )
-            elapsed = time.perf_counter() - started
-            raw_text = resp.text or "{}"
-            json_text = _extract_json_from_text(raw_text)
-            data = json.loads(json_text)
-            data["_elapsed_s"] = round(elapsed, 3)
-            return data
-        except Exception as exc:
-            last_exc = exc
-            logger.warning("[LLM RETRY] attempt=%d/%d error=%s", attempt, _MAX_RETRIES, exc)
-            if attempt < _MAX_RETRIES:
-                time.sleep(1)
-    raise last_exc
-
-
-def _call_gemini_text(prompt_sys: str, prompt_user: str, temperature: float) -> str:
-    config = genai_types.GenerateContentConfig(
-        system_instruction=prompt_sys,
-        temperature=temperature,
-    )
-    resp = _gemini_client.models.generate_content(
-        model=MODEL_NAME,
-        contents=prompt_user,
-        config=config,
-    )
-    return resp.text or ""
-
-
-# ── 통합 인터페이스 ──
+# ── 통합 인터페이스 (provider에 위임) ──
 
 def _call_llm_json(prompt_sys: str, prompt_user: str, temperature: float = 0.2) -> dict:
     started = time.perf_counter()
     logger.info("[LLM REQUEST] temp=%.2f\n[SYSTEM]\n%s\n[USER]\n%s", temperature, prompt_sys, prompt_user)
-
-    if LLM_PROVIDER == "gemini":
-        data = _call_gemini_json(prompt_sys, prompt_user, temperature)
-    else:
-        data = _call_openai_json(prompt_sys, prompt_user, temperature)
-
+    data = _provider.call_json(prompt_sys, prompt_user, temperature)
     elapsed = time.perf_counter() - started
     logger.info("[LLM RESPONSE] elapsed=%.2fs\n%s", elapsed, json.dumps(data, ensure_ascii=False, indent=2))
     return data
@@ -201,23 +58,18 @@ def _call_llm_vision_json(
     images_b64: list[str],
     temperature: float = 0.2,
 ) -> dict:
+    from ..config import LLM_VISION_ENABLED
+
+    if not LLM_VISION_ENABLED:
+        logger.info("[LLM VISION → TEXT fallback] LLM_VISION_ENABLED=false, 이미지 %d장 무시", len(images_b64))
+        return _call_llm_json(prompt_sys, prompt_user, temperature)
+
     started = time.perf_counter()
     logger.info(
         "[LLM VISION REQUEST] temp=%.2f images=%d\n[SYSTEM]\n%s\n[USER text]\n%s...",
         temperature, len(images_b64), prompt_sys, prompt_user[:500],
     )
-
-    if LLM_PROVIDER == "gemini":
-        data = _call_gemini_json(prompt_sys, prompt_user, temperature, images_b64=images_b64)
-    else:
-        user_content: list[dict] = [{"type": "text", "text": prompt_user}]
-        for img in images_b64:
-            user_content.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{img}", "detail": "high"},
-            })
-        data = _call_openai_json(prompt_sys, prompt_user, temperature, user_content=user_content)
-
+    data = _provider.call_vision_json(prompt_sys, prompt_user, images_b64, temperature)
     elapsed = time.perf_counter() - started
     logger.info("[LLM VISION RESPONSE] elapsed=%.2fs\n%s", elapsed, json.dumps(data, ensure_ascii=False, indent=2))
     return data
@@ -226,12 +78,7 @@ def _call_llm_vision_json(
 def _call_llm_text(prompt_sys: str, prompt_user: str, temperature: float = 0.2) -> str:
     started = time.perf_counter()
     logger.info("[LLM REQUEST] temp=%.2f\n[SYSTEM]\n%s\n[USER]\n%s", temperature, prompt_sys, prompt_user)
-
-    if LLM_PROVIDER == "gemini":
-        content = _call_gemini_text(prompt_sys, prompt_user, temperature)
-    else:
-        content = _call_openai_text(prompt_sys, prompt_user, temperature)
-
+    content = _provider.call_text(prompt_sys, prompt_user, temperature)
     elapsed = time.perf_counter() - started
     logger.info("[LLM RESPONSE] elapsed=%.2fs\n%s", elapsed, content[:2000])
     return content
@@ -523,6 +370,55 @@ async def agent_chunk_plan(
     return chunks
 
 
+# ─── 도메인별 analyze 분류 규칙 ─────────────────────────────────────
+
+_ANALYZE_RULES_PROPOSAL = """## 분류 카테고리
+- label: 라벨/제목/여백용 빈 셀.
+- fill: 내용을 채울 빈 필드. 넓은 빈 셀(15mm+).
+- placeholder: 교체 대상. 서식 마커(□, 가., ㅇ), 파란/빨간 가이드 텍스트.
+- instruction: 독립된 "< 작성요령 >" 표. tables_to_remove로 삭제.
+
+## 규칙
+- "< 작성요령 >" 독립 표 → category:"instruction", action:"keep", skip_fill:true + tables_to_remove
+- 파란/빨간 가이드 텍스트 → category:"placeholder", action:"replace", skip_fill:false
+- □, 가., ㅇ 서식 마커 → category:"placeholder", action:"replace", skip_fill:false
+- (여백셀) → category:"label", action:"keep", skip_fill:true
+
+## 예시
+입력: <table data-table-idx="12"><tr><td>< 작성요령 ></td></tr></table>
+출력: {"id":12,"category":"instruction","action":"keep","skip_fill":true}
+
+입력: <td data-style="...color=#0000FF...">* 과제의 목표를 기술</td>
+출력: {"id":5,"category":"placeholder","action":"replace","skip_fill":false,"reason":"가이드 교체"}"""
+
+_ANALYZE_RULES_PROJECT_STATUS = """## 분류 카테고리
+- label: 섹션 제목("1. 사업 개요" 등). 수정 불가.
+- placeholder: [대괄호] 플레이스홀더. 교체 대상.
+- fill: 빈 본문 노드.
+
+## 규칙
+- [대괄호] 포함 노드 → category:"placeholder", action:"replace", skip_fill:false
+- 섹션 제목 → category:"label", action:"keep", skip_fill:true
+- (빈칸) → category:"label", action:"keep", skip_fill:true
+
+## 예시
+입력: <td data-id="0">[사업명] 사업현황</td>
+출력: {"id":0,"category":"placeholder","action":"replace","skip_fill":false,"reason":"사업명 교체"}
+
+입력: <p data-id="3">1. 사업 개요</p>
+출력: {"id":3,"category":"label","action":"keep","skip_fill":true,"reason":"섹션 제목"}"""
+
+_ANALYZE_RULES_GENERIC = """## 분류 카테고리
+- label: 라벨/제목. 수정 불가.
+- fill: 내용을 채울 빈 필드.
+- placeholder: 교체 대상 (가이드 텍스트, [대괄호] 등).
+
+## 규칙
+- 볼드 제목 → category:"label", action:"keep", skip_fill:true
+- [대괄호] 텍스트 → category:"placeholder", action:"replace", skip_fill:false
+- 빈 필드 → category:"fill", action:"write", skip_fill:false"""
+
+
 async def agent_analyze_chunk(
     nodes: list[TextNode],
     chunk_idx: int = 0,
@@ -531,122 +427,86 @@ async def agent_analyze_chunk(
     chunk_image_b64: str = "",
     prev_chunk: list[TextNode] | None = None,
     next_chunk: list[TextNode] | None = None,
+    domain_type: str = "generic",
 ) -> dict:
     llm_nodes = _filter_llm_nodes(nodes)
     doc_view = _render_nodes_html(llm_nodes)
-    prompt_sys = (
-        "당신은 HWPX(한글) 양식 분석 전문가입니다. "
-        "사용자가 HWPX 양식을 업로드했으며, 각 노드를 분석해 실제 값을 채울 계획을 만드는 단계입니다.\n\n"
-        "★ 스크린샷이 제공되면 반드시 시각적 레이아웃을 우선 참고하세요. "
-        "실제 문서가 어떻게 보이는지(셀 크기, 색상, 빈 영역, 테두리 유무)를 눈으로 확인하고 판단하세요.\n"
-        "★ 앞뒤 청크가 참고용으로 제공될 수 있습니다. 현재 청크의 역할을 맥락적으로 파악하세요.\n"
-        "★ 분류 결과는 현재 청크의 노드에 대해서만 출력하세요.\n"
-        "★ 중요: 응답의 nodes 배열에서 id 값은 반드시 HTML의 data-id 속성값을 그대로 사용하세요. "
-        "0부터 시작하는 순번이 아닙니다. 예: data-id=\"307\"이면 id: 307."
-    )
+
+    # 시스템 프롬프트 — 스크린샷 관련 설명은 실제 스크린샷이 있을 때만
+    sys_parts = [
+        "당신은 HWPX(한글) 양식 분석 전문가입니다.",
+        "각 노드를 분석해 카테고리를 분류하세요.",
+        "id 값은 반드시 HTML의 data-id 속성값을 그대로 사용하세요.",
+    ]
+    if chunk_image_b64:
+        sys_parts.append("스크린샷이 제공됩니다. 시각적 레이아웃(셀 크기, 색상, 빈 영역)을 우선 참고하세요.")
+    prompt_sys = " ".join(sys_parts)
+
+    # 표 구조 정보
     table_summary_section = ""
     if table_summaries:
         chunk_table_idxs = {n.table_idx for n in nodes if n.type == "table_cell"}
         relevant = [s for s in table_summaries if s.table_idx in chunk_table_idxs]
         if relevant:
             summaries_text = "\n".join(s.summary_text() for s in relevant)
-            table_summary_section = f"""
-## 표 구조 분석 정보 (코드로 사전 측정)
-{summaries_text}
-"""
-    # 앞뒤 청크 컨텍스트 (요약만 — data-id 없이)
+            table_summary_section = f"\n## 표 구조\n{summaries_text}\n"
+
+    # 앞뒤 청크 컨텍스트
     context_section = ""
     if prev_chunk:
         prev_summary = _render_context_summary(prev_chunk)
         if prev_summary:
-            context_section += f"""
-## 이전 청크 (참고용 — 분류 대상 아님)
-{prev_summary}
-"""
+            context_section += f"\n## 이전 청크 (참고용)\n{prev_summary}\n"
     if next_chunk:
         next_summary = _render_context_summary(next_chunk)
         if next_summary:
-            context_section += f"""
-## 다음 청크 (참고용 — 분류 대상 아님)
-{next_summary}
-"""
+            context_section += f"\n## 다음 청크 (참고용)\n{next_summary}\n"
 
-    prompt_user = f"""다음은 HWPX 문서의 일부입니다.
+    # 도메인별 분류 규칙 + few-shot
+    if domain_type == "proposal":
+        category_and_examples = _ANALYZE_RULES_PROPOSAL
+    elif domain_type == "project_status":
+        category_and_examples = _ANALYZE_RULES_PROJECT_STATUS
+    else:
+        category_and_examples = _ANALYZE_RULES_GENERIC
 
-## 프로젝트 정보
-{report_description}
-{context_section}
-## 현재 청크 — 분류 대상 (이 청크의 노드만 분류하세요)
+    # 프로젝트 정보
+    project_section = f"## 프로젝트 정보\n{report_description}\n\n" if report_description else ""
+
+    prompt_user = f"""{project_section}## 문서 청크
 {doc_view}
-{table_summary_section}
+{table_summary_section}{context_section}
+{category_and_examples}
 
-## 분류 카테고리
-- label: 라벨/제목/여백용 빈 셀 (수정 불가). 항목명 옆의 작은 빈 셀(높이 ≤12mm)도 label.
-- fixed: 이미 채워진 실제 고유값 (수정 불가)
-- fill: 실제 내용을 채울 빈 필드. 본문의 빈칸이나 표의 넓은 빈 셀(높이 15mm+)이 해당.
-- placeholder: 실제 내용으로 교체할 대상. 서식 마커(□, 가., ㅇ), 파란색/빨간색 가이드 텍스트 등. 일반 표 안의 파란 가이드 텍스트는 여기에 해당 — instruction이 아님.
-- instruction: **독립된 "< 작성요령 >" 표** 안의 텍스트만 해당. tables_to_remove로 표 전체를 삭제할 때만 사용.
-- image_placeholder: 이미지/그림/도식 자리
-- index: 행 번호/인덱스
-
-## 핵심 원칙
-1) 스크린샷을 보고 판단하세요. 시각적으로 비어있는 영역, 색이 다른 텍스트, 셀 크기 비율을 확인하세요.
-2) "작성 요령", "< 작성요령 >" 등이 포함된 **독립된 표**는 instruction + tables_to_remove에 추가. tables_to_remove에는 data-table-idx 값을 사용하세요.
-3) 파란색/빨간색 가이드 텍스트가 일반 표(삭제하지 않는 표) 안에 있으면 → placeholder + replace. 이 텍스트는 instruction이 아님.
-4) "□", "가.", "ㅇ" 같은 서식 마커는 placeholder + replace로 분류하세요.
-5) 빈 본문 노드: 서식 마커나 소제목 뒤의 빈칸은 fill(내용 채울 자리), 그 외 여백용 빈 줄은 label(유지).
-
-## few-shot 예시
-
-예시1: 독립된 작성요령 표 → instruction + tables_to_remove
-입력: <table data-table-idx="12"><tr><td>< 작성요령 ></td></tr><tr><td data-style="...color=#0000FF...">ㅇ 수요기관이 본 과제를 제안하게 된 배경...</td></tr></table>
-출력: tables_to_remove=[12], 모든 셀 → instruction/keep/skip_fill=true
-
-예시2: 서식 마커 + 빈칸 (본문)
-입력:
-<p>□</p>
-<p>(빈칸)</p>
-<p>가.</p>
-<p>ㅇ</p>
-출력: □,가.,ㅇ → placeholder/replace, (빈칸) → label
-
-예시3: 소제목 + 빈칸 (내용 채울 자리)
-입력:
-<p data-style="...bold...">가. 시장 현황</p>
-(작성요령 표 — 삭제됨)
-<p>(빈칸)</p>
-<p>(빈칸)</p>
-<p data-style="...bold...">나. 시장 동향</p>
-출력: 소제목 → label, 빈칸들 → fill/write, 다음 소제목 → label
-
-예시4: [소제목][여백셀] + [color=#0000FF 셀] 패턴
-입력:
-<table>
-  <tr>
-    <td data-size="34x10mm" data-style="S:style=바탕글,size=1000,bold,color=#000000,align=JUSTIFY">6. 과제목표</td>
-    <td data-size="131x10mm" data-style="S:style=바탕글,size=1000,color=#000000,align=JUSTIFY">(여백셀)</td>
-  </tr>
-  <tr>
-    <td data-size="165x26mm" data-style="S:style=바탕글,size=1000,italic,color=#0000FF,align=JUSTIFY" colspan="3">* 과제의 목표 및 ... 정량적, 정성적으로 기술</td>
-  </tr>
-</table>
-출력:
-  bold 소제목 → label/keep/skip_fill=true
-  (여백셀) → label/keep/skip_fill=true  ★ (여백셀)은 절대 채우지 않음
-  color=#0000FF 셀 → placeholder/replace/skip_fill=false  ★ 이 셀의 가이드를 지우고 실제 내용 작성
-
-## 출력(JSON)
-★ tables_to_remove 배열에는 반드시 data-table-idx 속성값(절대 인덱스)을 넣으세요. 0부터 시작하는 상대 순번이 아닙니다.
-★ tables_to_remove는 "작성요령/안내문" 표에만 사용하세요. 데이터를 채워야 하는 표에는 절대 사용하지 마세요.
-{{"tables_to_remove":[],"nodes":[{{"id":1,"category":"fill","action":"write","skip_fill":false,"reason":"...","role":"summary_header","detail_node":2,"max_chars":30}}]}}
+## 출력(JSON만, 설명 없이)
+{{"tables_to_remove":[],"nodes":[{{"id":1,"category":"fill","action":"write","skip_fill":false,"reason":"..."}}]}}
 """
-    if chunk_image_b64:
-        return await asyncio.to_thread(
-            _call_llm_vision_json, prompt_sys, prompt_user, [chunk_image_b64], 0.2
+    # 분석 결과 검증 + 재시도: nodes 배열이 비어있으면 재시도
+    _ANALYZE_MAX_RETRIES = 2
+    for _analyze_attempt in range(1, _ANALYZE_MAX_RETRIES + 1):
+        if chunk_image_b64:
+            result = await asyncio.to_thread(
+                _call_llm_vision_json, prompt_sys, prompt_user, [chunk_image_b64], 0.2
+            )
+        else:
+            result = await asyncio.to_thread(
+                _call_llm_json, prompt_sys, prompt_user, 0.2
+            )
+        # 검증: nodes 배열이 있고 비어있지 않은지
+        result_nodes = result.get("nodes") if isinstance(result, dict) else None
+        if isinstance(result_nodes, list) and len(result_nodes) > 0:
+            return result
+        logger.warning(
+            "[analyze 검증실패] 청크 %d: attempt=%d/%d — nodes 배열 비어있음 (keys=%s). 재시도.",
+            chunk_idx, _analyze_attempt, _ANALYZE_MAX_RETRIES,
+            list(result.keys()) if isinstance(result, dict) else type(result).__name__,
         )
-    return await asyncio.to_thread(
-        _call_llm_json, prompt_sys, prompt_user, 0.2
+    # 모든 재시도 실패 — 마지막 결과라도 반환
+    logger.error(
+        "[analyze 최종실패] 청크 %d: %d회 시도 후에도 유효한 nodes 없음. 빈 분석 결과 반환.",
+        chunk_idx, _ANALYZE_MAX_RETRIES,
     )
+    return result
 
 
 async def agent_generate_rag_queries(
@@ -714,22 +574,40 @@ async def agent_fill_chunk(
     report_topic: str,
     report_description: str = "",
     reference_text: str = "",
+    domain_guide: str = "",
 ) -> dict:
     llm_nodes = _filter_llm_nodes(nodes)
     doc_view = _render_nodes_html(llm_nodes)
     analysis_view = json.dumps(analysis, ensure_ascii=False, indent=2)
-    prompt_sys = "당신은 한국어 보고서 양식 작성 전문가입니다."
-    prompt_user = f"""아래 보고서 주제와 설명에 맞춰 HWPX 양식을 채우세요.
+    domain_section = ""
+    if domain_guide:
+        domain_section = f"""
+## 도메인 가이드 (문서 유형별 작성 지침)
 
-## 보고서 주제
+{domain_guide}
+
+★ 도메인 가이드가 제공되었으므로 반드시 그 지침을 따르세요.
+도메인 가이드의 섹션 패턴, 분량 가이드, 작성 원칙이 일반 규칙보다 우선합니다.
+"""
+
+    from ..config import IMAGE_GENERATION_ENABLED
+
+    prompt_sys = "당신은 한국어 보고서 양식 작성 전문가입니다. JSON만 출력하세요."
+
+    # 참고 텍스트 섹션 (있을 때만)
+    ref_section = f"\n## 참고 텍스트\n{reference_text}\n" if reference_text else ""
+
+    # 각주 규칙 (도메인 가이드에 이미 포함된 경우 생략 가능하지만 간결하게 유지)
+    footnote_rule = "각주: [FN:본문텍스트|각주설명] 형식. 약어 첫 등장 시에만."
+
+    # 이미지 마커 규칙 (이미지 생성이 켜져있을 때만)
+    image_rule = ""
+    if IMAGE_GENERATION_ENABLED:
+        image_rule = "\n이미지가 효과적인 곳에 [IMAGE:설명] 마커 삽입. 작은 표 셀에는 넣지 마세요."
+
+    prompt_user = f"""## 보고서 주제
 {report_topic}
-
-## 보고서 설명
-{report_description}
-
-## 참고 텍스트
-{reference_text}
-
+{domain_section}{ref_section}
 ## 문서(HTML)
 {doc_view}
 
@@ -737,30 +615,11 @@ async def agent_fill_chunk(
 {analysis_view}
 
 ## 작업
-action이 write/replace이고 skip_fill=false인 노드만 작성합니다.
-skip_fill=true인 노드는 작성하지 마세요.
+action=write/replace이고 skip_fill=false인 노드만 작성. id는 data-id 값 그대로 사용.
+표 셀은 data-size에 맞게 분량 조절.
+{footnote_rule}{image_rule}
 
-★ 서식 마커("□", "가.", "ㅇ") 작성법:
-  마커를 포함한 전체 텍스트를 작성하세요.
-  "가." 노드에는 가/나/다 소제목과 각 소제목 아래 ㅇ 불릿 내용을 전부 포함하세요.
-  ★ 들여쓰기로 계층 구조를 반드시 표현하세요:
-    □ 는 최상위 (들여쓰기 없음)
-    가./나./다. 는 2칸 들여쓰기
-    ㅇ 는 4칸 들여쓰기
-  예:
-  "□ 추진배경 및 필요성\n\n  가. 현장 운영 환경\n    ㅇ 내용...\n    ㅇ 내용...\n\n  나. 디지털 전환 요구\n    ㅇ 내용...\n\n  다. 혁신 방향\n    ㅇ 내용..."
-
-★ 표 셀은 data-size(WxH mm)에 맞게 분량을 조절하세요. 작은 셀은 한 문장, 큰 셀은 충분히.
-★ 정부 R&D 제안서 수준의 분량으로 구체적이고 충실하게 작성하세요.
-
-★ 이미지 삽입: 시스템 구성도, 아키텍처, 추진체계도, 기대효과 비교 등 시각자료가 효과적인 곳에는
-  텍스트 중간이나 끝에 [IMAGE:이미지 설명 프롬프트] 마커를 삽입하세요.
-  예: "... 시스템 구성은 다음과 같다.\n[IMAGE:AI 비전검사 시스템 아키텍처 구성도]\n위 구성을 통해..."
-  단, 단순 텍스트(인력, 예산, 일정 등)에는 이미지 마커를 넣지 마세요.
-  본문 노드(큰 영역)에만 넣고, 작은 표 셀에는 넣지 마세요.
-
-## 출력(JSON)
-★ id는 반드시 HTML의 data-id 속성값을 그대로 사용하세요 (0부터 시작하는 순번 아님).
+## 출력(JSON만, 설명 없이)
 {{"fills":[{{"id":307,"new_text":"..."}}]}}
 """
     return await asyncio.to_thread(
@@ -956,3 +815,132 @@ async def agent_select_reference_images(
             "target_node_id": target_nid,
         })
     return chosen
+
+
+# ─── 소스 참고자료 청크 선택 ─────────────────────────────────────────
+
+_BATCH_SIZE = 200  # 배치당 최대 청크 수
+_MAX_SELECT_PER_BATCH = 4  # 배치당 최대 선택 수
+
+
+async def agent_select_source_chunks(
+    nodes: list[TextNode],
+    analysis: dict,
+    source_chunks: list[dict],
+    report_topic: str,
+    report_description: str = "",
+    max_select: int = 4,
+) -> list[int]:
+    """템플릿 청크 내용을 기반으로 관련 소스 참고자료 청크를 선택한다.
+
+    - 200개 이하: 한번에 선택
+    - 200개 초과: 200개씩 배치로 나눠서 각 배치에서 최대 5개 선택 → 전부 합침
+
+    Returns:
+        선택된 소스 청크의 인덱스 리스트 (source_chunks 리스트 기준)
+    """
+    if not source_chunks or not nodes:
+        return []
+
+    fill_nodes_info = _build_fill_nodes_info(nodes, analysis)
+    if not fill_nodes_info:
+        return []
+
+    fill_summary = "\n".join(fill_nodes_info[:20])
+    total = len(source_chunks)
+
+    if total <= _BATCH_SIZE:
+        return await _select_batch(
+            source_chunks, 0, fill_summary, report_topic, report_description, max_select,
+        )
+
+    # 배치 페이징: 200개씩 끊어서 각 배치에서 5개씩 선택, 전부 합침
+    all_selected: list[int] = []
+    batch_count = (total + _BATCH_SIZE - 1) // _BATCH_SIZE
+    logger.info("[소스참고] 청크 %d개 → %d개 배치 (배치당 %d개)", total, batch_count, _BATCH_SIZE)
+
+    for batch_idx in range(batch_count):
+        start = batch_idx * _BATCH_SIZE
+        end = min(start + _BATCH_SIZE, total)
+        batch = source_chunks[start:end]
+        logger.info("[소스참고] 배치 %d/%d (청크 %d~%d)", batch_idx + 1, batch_count, start, end - 1)
+        selected = await _select_batch(
+            batch, start, fill_summary, report_topic, report_description, _MAX_SELECT_PER_BATCH,
+        )
+        all_selected.extend(selected)
+
+    logger.info("[소스참고] 전체 배치 결과: %d개 청크 선택", len(all_selected))
+    return all_selected
+
+
+def _build_fill_nodes_info(nodes: list[TextNode], analysis: dict) -> list[str]:
+    """분석 결과에서 작성 대상 노드 정보를 추출한다."""
+    fill_nodes_info = []
+    node_map = {n.id: n for n in nodes}
+    for item in (analysis.get("nodes") or []):
+        if item.get("skip_fill"):
+            continue
+        action = (item.get("action") or "").lower()
+        if action not in ("write", "replace"):
+            continue
+        nid = item.get("id")
+        node = node_map.get(nid)
+        if node:
+            label = item.get("reason") or item.get("category") or ""
+            text = (node.text or "")[:80]
+            fill_nodes_info.append(f"- [{label}] {text}" if text else f"- [{label}] (빈칸)")
+    return fill_nodes_info
+
+
+async def _select_batch(
+    batch_chunks: list[dict],
+    offset: int,
+    fill_summary: str,
+    report_topic: str,
+    report_description: str,
+    max_select: int,
+) -> list[int]:
+    """배치 내 청크 summary를 보고 선택. offset은 원본 인덱스 기준."""
+    summary_list = []
+    for i, chunk in enumerate(batch_chunks):
+        orig_idx = offset + i
+        fn = chunk.get("file_name", "")
+        ci = chunk.get("chunk_index", 0)
+        summary = chunk.get("summary", "")
+        summary_list.append(f"[{orig_idx}] 파일: {fn} | 청크#{ci} | 요약: {summary}")
+
+    source_summary = "\n".join(summary_list)
+
+    prompt_sys = (
+        "당신은 보고서 작성을 위한 참고자료 선택 전문가입니다. "
+        "사용자가 보고서 양식의 특정 부분을 작성하려 합니다. "
+        "제공된 참고자료 청크 요약을 검토하고, "
+        "현재 작성할 부분과 관련된 청크만 선택하세요."
+    )
+    prompt_user = f"""## 보고서 주제
+{report_topic}
+
+## 보고서 설명
+{report_description}
+
+## 현재 작성할 항목들
+{fill_summary}
+
+## 참고자료 청크 목록 (요약)
+{source_summary}
+
+## 작업
+위 참고자료 중에서 현재 작성할 항목에 도움이 되는 청크를 최대 {max_select}개 선택하세요.
+- 대괄호 안의 숫자가 인덱스입니다. 그 숫자를 그대로 반환하세요.
+- 관련 없는 청크는 선택하지 마세요.
+- 관련 청크가 없으면 빈 배열을 반환하세요.
+
+## 출력(JSON)
+{{"selected_indices": [0, 3, 7]}}
+"""
+    result = await asyncio.to_thread(_call_llm_json, prompt_sys, prompt_user, 0.2)
+    indices = result.get("selected_indices") or []
+    if not isinstance(indices, list):
+        return []
+    valid_range = set(range(offset, offset + len(batch_chunks)))
+    return [idx for idx in indices[:max_select] if isinstance(idx, int) and idx in valid_range]

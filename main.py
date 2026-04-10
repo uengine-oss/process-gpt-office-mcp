@@ -146,4 +146,9 @@ app = mcp.http_app(
 app.routes.extend(rest_routes)
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=1192, lifespan="on")
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    from office_mcp.config import log_config_summary
+    log_config_summary()
+    from office_mcp.config import SERVER_PORT
+    uvicorn.run(app, host="0.0.0.0", port=SERVER_PORT, lifespan="on")

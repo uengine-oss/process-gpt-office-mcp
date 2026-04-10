@@ -861,7 +861,8 @@ def _get_client():
     except Exception as exc:
         logger.warning("[이미지] google-genai import 실패: %s", exc)
         return None
-    api_key = (os.getenv("GOOGLE_API_KEY") or "").strip()
+    from .config import GOOGLE_API_KEY
+    api_key = GOOGLE_API_KEY
     if not api_key:
         logger.warning("[이미지] GOOGLE_API_KEY 없음 — 이미지 생성 불가")
         return None

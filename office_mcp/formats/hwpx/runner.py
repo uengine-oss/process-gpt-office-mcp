@@ -14,6 +14,7 @@ from ...agent.agent import (
     agent_generate_rag_queries,
     agent_judge_image_reference,
     agent_select_reference_images,
+    agent_select_source_chunks,
 )
 from ...memento import search_memento_multi_query, search_memento_images_multi_query, sources_to_reference_text
 from ...config import (
@@ -23,6 +24,7 @@ from ...config import (
     IMAGE_MIN_HEIGHT_MM,
     IMAGE_MIN_WIDTH_MM,
     IMAGE_REFERENCE_ENABLED,
+    LLM_VISION_ENABLED,
     MAX_CONCURRENT_LLM,
     VISION_CHUNK_PLAN_ENABLED,
 )
@@ -32,6 +34,7 @@ from ...core.html_screenshots import init_capture, close_capture, screenshot_chu
 from ...core.parser import parse_section, scan_header_charpr
 from ...core.style_mapper import load_style_maps, log_style_summary, StyleMaps
 from ...core.table_analyzer import build_table_summaries
+from ...domains import detect_domain
 from ...io.file import extract_hwpx, find_section_files, repack_hwpx
 from .hwpx_to_html import hwpx_to_html
 
@@ -346,9 +349,17 @@ async def process_hwpx_file(
     tenant_id: str = "",
     max_concurrent_llm: int = MAX_CONCURRENT_LLM,
     selected_file_names: list[str] | None = None,
+    image_generation_enabled: bool | None = None,
+    image_reference_enabled: bool | None = None,
+    source_chunks: list[dict] | None = None,
 ) -> str:
     if not report_topic:
         raise ValueError("report_topic is required")
+
+    if source_chunks:
+        logger.info("[소스참고] 소스 참고자료 청크 %d개 수신", len(source_chunks))
+    else:
+        logger.info("[소스참고] 소스 참고자료 없음 — 기존 RAG/reference_text 방식 사용")
 
     sem = asyncio.Semaphore(max_concurrent_llm)
     screenshot_sem = asyncio.Semaphore(3)  # Playwright 동시 페이지 수 제한
@@ -393,7 +404,7 @@ async def process_hwpx_file(
 
         # 비전 분석용: 전체 HWPX → HTML → Playwright 브라우저 준비
         full_capture = None
-        if VISION_CHUNK_PLAN_ENABLED:
+        if VISION_CHUNK_PLAN_ENABLED and LLM_VISION_ENABLED:
             try:
                 logger.info("[비전] HWPX → HTML 변환 시작 (inject_ids=True)")
                 html_preview_path = Path(tmp_dir) / "preview_vision.html"
@@ -411,6 +422,18 @@ async def process_hwpx_file(
             except Exception as exc:
                 logger.warning("[비전] 캡처 초기화 실패 (텍스트 전용 폴백): %s", exc, exc_info=True)
                 full_capture = None
+
+        # ── 도메인 감지: 첫 번째 섹션의 노드로 문서 유형 판별 (LLM 기반) ──
+        domain_type = "generic"
+        domain_guide = ""
+        first_section_nodes = None
+        for sf_tmp in section_files:
+            first_section_nodes, _, _, _ = parse_section(sf_tmp, style_maps=style_maps)
+            if first_section_nodes:
+                break
+        if first_section_nodes:
+            domain_type, domain_guide = await detect_domain(first_section_nodes)
+        logger.info("[도메인] 감지 결과: type=%s, guide_len=%d", domain_type, len(domain_guide))
 
         logger.info("HWPX sections=%d", len(section_files))
         for sf in section_files:
@@ -460,6 +483,7 @@ async def process_hwpx_file(
                         logger.warning("[비전] 청크 %d 스크린샷 실패: %s", chunk_idx, exc)
                         chunk_image_b64 = ""
 
+                logger.info("[청크처리] 청크 %d: agent_analyze_chunk 호출 시작 (nodes=%d)", chunk_idx, len(chunk))
                 async with sem:
                     analysis = await agent_analyze_chunk(
                         chunk,
@@ -467,14 +491,17 @@ async def process_hwpx_file(
                         table_summaries=table_summaries,
                         chunk_image_b64=chunk_image_b64,
                         prev_chunk=prev_chunk,
+                        domain_type=domain_type,
                         next_chunk=next_chunk,
                     )
+                logger.info("[청크처리] 청크 %d: agent_analyze_chunk 완료", chunk_idx)
                 analysis = _inject_role_pairs(analysis, chunk)
 
                 # ── RAG 쿼리 생성 + 이미지 판단을 병렬 실행 ──
                 chunk_reference = reference_text
                 chunk_ref_images: list[dict] = []
-                image_ref_enabled = IMAGE_REFERENCE_ENABLED and bool((tenant_id or "").strip())
+                _img_ref_cfg = image_reference_enabled if image_reference_enabled is not None else IMAGE_REFERENCE_ENABLED
+                image_ref_enabled = _img_ref_cfg and bool((tenant_id or "").strip())
                 has_tenant = bool((tenant_id or "").strip())
 
                 async def _do_rag() -> str:
@@ -643,6 +670,36 @@ async def process_hwpx_file(
                                 chunk_idx, sorted(chunk_remove_idxs), overridden,
                             )
 
+                # ── ②-b 소스 참고자료 청크 선택 (source_chunks가 있을 때) ──
+                if source_chunks:
+                    try:
+                        async with sem:
+                            selected_indices = await agent_select_source_chunks(
+                                chunk, analysis, source_chunks,
+                                report_topic=report_topic,
+                                report_description=report_description,
+                            )
+                        if selected_indices:
+                            source_texts = []
+                            for idx in selected_indices:
+                                sc = source_chunks[idx]
+                                fn = sc.get("file_name", "")
+                                orig = sc.get("original_text", "")
+                                source_texts.append(f"[출처: {fn}]\n{orig}")
+                            source_reference = "\n\n---\n\n".join(source_texts)
+                            if chunk_reference:
+                                chunk_reference = source_reference + "\n\n---\n\n" + chunk_reference
+                            else:
+                                chunk_reference = source_reference
+                            logger.info(
+                                "[소스참고] 청크 %d: 소스 청크 %d개 선택 → reference_text에 추가 (%.1f KB)",
+                                chunk_idx, len(selected_indices), len(source_reference) / 1024,
+                            )
+                        else:
+                            logger.info("[소스참고] 청크 %d: 관련 소스 청크 없음", chunk_idx)
+                    except Exception as exc:
+                        logger.warning("[소스참고] 청크 %d: 선택 실패 — %s", chunk_idx, exc)
+
                 # ── ③ 오버라이드 반영된 analysis로 fill 생성 ──
                 async with sem:
                     filled = await agent_fill_chunk(
@@ -651,6 +708,7 @@ async def process_hwpx_file(
                         report_topic=report_topic,
                         report_description=report_description,
                         reference_text=chunk_reference,
+                        domain_guide=domain_guide,
                     )
 
                 # ── ④ category_map / action_map 수집 ──
@@ -712,6 +770,7 @@ async def process_hwpx_file(
                     filled["_reference_images"] = chunk_ref_images
                 return filled
 
+            logger.info("[청크처리] asyncio.gather 시작: %d개 청크", len(chunks))
             results = await asyncio.gather(*[
                 _process_chunk(
                     c, i,
@@ -757,7 +816,7 @@ async def process_hwpx_file(
                     len(all_reference_images),
                     list({img.get("node").id for img in all_reference_images if img.get("node")}),
                 )
-            elif IMAGE_REFERENCE_ENABLED:
+            elif (image_reference_enabled if image_reference_enabled is not None else IMAGE_REFERENCE_ENABLED):
                 logger.info("[이미지참조] ━━ 전체 수집 완료: 참조 이미지 없음")
 
             # tables_to_remove에 포함된 표의 모든 노드는 강제 skip
@@ -775,9 +834,24 @@ async def process_hwpx_file(
             all_fills: list[dict] = []
             FILLABLE = ("fill", "placeholder")
             ACTION_FILLABLE = ("write", "replace")
+
+            # 안전장치: analyze가 완전 실패하여 category_map이 비어있으면
+            # fill 결과를 그대로 통과시킴 (tables_to_remove만 체크)
+            analyze_failed = not category_map
+            if analyze_failed and all_raw:
+                logger.warning(
+                    "[fill필터] ⚠ category_map 비어있음 (analyze 실패). "
+                    "fill 결과 %d개를 필터 없이 통과시킵니다.",
+                    len(all_raw),
+                )
+
             for f in all_raw:
                 if f["id"] in remove_node_ids_by_table:
                     logger.info("[fill필터] node %d: tables_to_remove 차단", f["id"])
+                    continue
+                if analyze_failed:
+                    # analyze 실패 시 fill 결과 그대로 통과
+                    all_fills.append(f)
                     continue
                 cat, skip = category_map.get(f["id"], ("", False))
                 action = action_map.get(f["id"], "")
@@ -791,7 +865,7 @@ async def process_hwpx_file(
             logger.info("[fill필터] all_raw=%d → all_fills=%d (통과 ID: %s)",
                         len(all_raw), len(all_fills), [f["id"] for f in all_fills])
 
-            image_insert_enabled = IMAGE_GENERATION_ENABLED
+            image_insert_enabled = image_generation_enabled if image_generation_enabled is not None else IMAGE_GENERATION_ENABLED
             node_by_id = {n.id: n for n in nodes if n.id is not None}
             image_inserts: list[dict] = []
             marker_total = 0
