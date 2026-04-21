@@ -101,6 +101,41 @@ async def _broad_search(query: str, tenant_id: str, top_k: int = 15) -> List[Dic
                 return []
 
 
+async def _room_search(query: str, tenant_id: str, room_id: str, top_k: int = 15) -> List[Dict[str, Any]]:
+    """채팅방(room_id)에 업로드된 문서만 대상으로 memento /retrieve 호출.
+
+    드라이브 폴더 필터는 쓰지 않는다 — 방에 올린 파일만 대상으로 한다.
+    """
+    url = f"{_get_memento_url()}/retrieve"
+    async with _MEMENTO_SEM:
+        async with httpx.AsyncClient(timeout=60) as client:
+            try:
+                response = await client.get(
+                    url,
+                    params={
+                        "query": query,
+                        "tenant_id": tenant_id,
+                        "room_id": room_id,
+                        "top_k": top_k,
+                    },
+                )
+                if response.status_code == 422:
+                    response = await client.get(
+                        url,
+                        params={
+                            "query": query,
+                            "tenant_id": tenant_id,
+                            "room_id": room_id,
+                        },
+                    )
+                response.raise_for_status()
+                data = response.json()
+                return _docs_to_sources(data.get("response") or [])
+            except Exception as exc:
+                logger.warning("memento room 검색 실패 (room_id=%s): %s", room_id, exc)
+                return []
+
+
 async def _list_documents(tenant_id: str) -> List[str]:
     url = f"{_get_memento_url()}/documents/list"
     params = {"tenant_id": tenant_id, **_get_drive_folder_param()}
@@ -397,9 +432,14 @@ async def search_memento_smart(
     query: str,
     outline: List[str],
     tenant_id: str,
+    room_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """문서-우선 스마트 Memento 검색.
 
+    room_id가 있으면 채팅방 업로드 문서만 대상으로 단순 /retrieve를 수행하고
+    아래 드라이브 기반 문서 선택 플로우(Step 1~6)는 스킵한다.
+
+    드라이브 기반(기존) 플로우:
     1. 문서 목록 조회 (실패 시 브로드 검색 폴백)
     2. LLM이 쿼리 기반으로 문서 선택
     3. 선택된 문서의 청크 메타데이터 조회
@@ -409,6 +449,18 @@ async def search_memento_smart(
     """
     if not tenant_id:
         return []
+
+    # 채팅방 시나리오: room에 올린 문서만 참조 → 드라이브 선택 단계 스킵
+    if room_id:
+        logger.info("search_memento_smart(room) 시작 (query=%s, tenant_id=%s, room_id=%s)", query, tenant_id, room_id)
+        room_sources = await _room_search(query, tenant_id, room_id, top_k=15)
+        for s in room_sources:
+            s.pop("_chunk_index", None)
+            s.pop("_file_name", None)
+            s.pop("_drive_folder_name", None)
+            s.pop("_section_title", None)
+        logger.info("search_memento_smart(room) 완료: %d 청크", len(room_sources))
+        return room_sources
 
     logger.info("search_memento_smart 시작 (query=%s, tenant_id=%s)", query, tenant_id)
 

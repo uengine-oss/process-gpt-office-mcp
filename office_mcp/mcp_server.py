@@ -272,7 +272,9 @@ def _upload_html_to_storage(file_path: Path, output_name: str) -> str:
 
 
 
-@mcp.tool
+# NOTE: 참고문서 사용자 선택 플로우 제거로 툴 노출 비활성화.
+#       다시 쓰려면 아래 @mcp.tool 주석만 해제하면 된다.
+# @mcp.tool
 async def list_reference_documents(
     query: Annotated[str, Field(description="검색 쿼리 (예: 보고서 주제)")],
     tenant_id: Annotated[str, Field(description="테넌트 ID")],
@@ -364,15 +366,12 @@ async def generate_hwpx(
     user_jwt: Annotated[Optional[str], Field(description="사용자 JWT (자동 주입)")] = "",
     user_uid: Annotated[Optional[str], Field(description="사용자 UID (자동 주입)")] = "",
     user_email: Annotated[Optional[str], Field(description="사용자 이메일 (자동 주입)")] = "",
+    room_id: Annotated[Optional[str], Field(description="채팅방 ID (자동 주입). 있으면 방에 업로드된 문서만 참조하며 드라이브 검색을 스킵한다.")] = "",
 ) -> dict:
     """HWPX 템플릿을 채워 스토리지 URL로 반환한다.
 
-    [사전 조건] tenant_id가 있는 경우 이 도구를 호출하기 전에 반드시 list_reference_documents를 먼저 호출해야 한다.
-    list_reference_documents → 사용자 문서 선택 확인 → 이 도구 호출 순서를 반드시 지킨다.
-    사용자가 "전부 참고해서 작성해줘" 또는 "참고 문서 없이 작성해 주세요"라고 한 경우에는 reference_documents 없이 바로 호출한다.
-
-    reference_documents가 있으면 해당 문서만 참고하여 작성하고, 없으면 memento 전체 검색을 수행한다.
-    사용자가 "참고 문서 없이 작성해 주세요"라고 하면 reference_documents를 비워두고 호출한다.
+    사용자가 HWPX 작성을 요청하면 즉시 이 도구를 호출한다 (참고문서 선택 플로우 없음).
+    reference_documents가 비어 있으면 memento 전체 검색으로 관련 자료를 자동 조회한다.
     사용자가 이미지 생성/참조 옵션을 선택한 경우 image_generation_enabled, image_reference_enabled에 전달한다.
     """
     if not template_url:
@@ -415,11 +414,12 @@ async def generate_hwpx(
                 )
                 logger.info("generate_hwpx: 선택 문서 기반 검색 완료 (%d개 소스)", len(memento_sources))
             else:
-                # 전체 문서에서 스마트 검색
+                # room_id가 있으면 방 문서만, 없으면 전체 드라이브에서 스마트 검색
                 memento_sources = await search_memento_smart(
                     query=report_topic,
                     outline=[report_description] if report_description else [report_topic],
                     tenant_id=tenant_id.strip(),
+                    room_id=(room_id or "").strip() or None,
                 )
 
             if memento_sources:
@@ -695,11 +695,12 @@ async def generate_docx(
     user_jwt: Annotated[Optional[str], Field(description="사용자 JWT (자동 주입)")] = "",
     user_uid: Annotated[Optional[str], Field(description="사용자 UID (자동 주입)")] = "",
     user_email: Annotated[Optional[str], Field(description="사용자 이메일 (자동 주입)")] = "",
+    room_id: Annotated[Optional[str], Field(description="채팅방 ID (자동 주입). 있으면 방에 업로드된 문서만 참조하며 드라이브 검색을 스킵한다.")] = "",
 ) -> dict:
     """DOCX 템플릿을 LLM으로 채워 스토리지 URL로 반환한다.
 
-    [사전 조건] tenant_id가 있는 경우 이 도구를 호출하기 전에 반드시 list_reference_documents를 먼저 호출해야 한다.
-    사용자가 문서를 선택한 후에만 이 도구를 호출한다.
+    사용자가 DOCX 작성을 요청하면 즉시 이 도구를 호출한다 (참고문서 선택 플로우 없음).
+    reference_documents가 비어 있으면 memento 전체 검색으로 관련 자료를 자동 조회한다.
     """
     if not template_url:
         raise ValueError("template_url is required")
@@ -722,6 +723,7 @@ async def generate_docx(
                 query=query,
                 outline=outline if outline else [query],
                 tenant_id=tenant_id.strip(),
+                room_id=(room_id or "").strip() or None,
             )
             if memento_sources:
                 sources = memento_sources + sources
@@ -992,6 +994,7 @@ async def generate_slides(
     user_jwt: Annotated[Optional[str], Field(description="사용자 JWT (자동 주입)")] = "",
     user_uid: Annotated[Optional[str], Field(description="사용자 UID (자동 주입)")] = "",
     user_email: Annotated[Optional[str], Field(description="사용자 이메일 (자동 주입)")] = "",
+    room_id: Annotated[Optional[str], Field(description="채팅방 ID (자동 주입). 있으면 방에 업로드된 문서만 참조한다.")] = "",
 ) -> dict:
     """슬라이드 마크다운과 이미지를 생성해 반환한다.
 
@@ -1038,6 +1041,7 @@ async def generate_slides(
                     query=research_goal,
                     outline=outline if outline else [research_goal],
                     tenant_id=tenant_id.strip(),
+                    room_id=(room_id or "").strip() or None,
                 )
                 if memento_sources:
                     sources = memento_sources + sources

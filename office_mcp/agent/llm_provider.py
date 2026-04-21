@@ -35,6 +35,62 @@ def _extract_json_from_text(text: str) -> str:
     return text
 
 
+def _find_balanced_json(text: str) -> dict | None:
+    """본문 내에 포함된 첫 번째로 parse되는 균형 잡힌 {...} 블록을 찾아 반환."""
+    for i, c in enumerate(text):
+        if c != "{":
+            continue
+        depth = 0
+        in_str = False
+        esc = False
+        for j in range(i, len(text)):
+            ch = text[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[i:j + 1])
+                    except Exception:
+                        break
+    return None
+
+
+def _robust_json_loads(text: str) -> dict:
+    """LLM 응답에서 JSON을 최대한 회복시켜 파싱.
+
+    일부 모델(특히 reasoning 스트리밍)이 중첩/escape된 JSON을 내뱉는 경우가 있어
+    다단 fallback으로 복구한다.
+    """
+    raw = _extract_json_from_text(text)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    # 1) 원본에서 균형 잡힌 JSON 블록 탐색
+    found = _find_balanced_json(raw)
+    if found is not None:
+        return found
+    # 2) escape 되어 문자열로 감싸진 JSON인 경우 unescape 후 재탐색
+    unescaped = raw.replace('\\"', '"').replace("\\n", "\n").replace("\\t", "\t")
+    found = _find_balanced_json(unescaped)
+    if found is not None:
+        return found
+    # 회복 실패 — 원 에러 재발생
+    return json.loads(raw)
+
+
 # ── Abstract base ──
 
 class LLMProvider(ABC):
@@ -202,8 +258,8 @@ class OpenAIProvider(LLMProvider):
                     if attempt < _MAX_RETRIES:
                         time.sleep(1)
                         continue
-                # 모델이 ```json ... ``` 으로 감싸는 경우 처리
-                data = json.loads(_extract_json_from_text(content))
+                # 모델이 ```json ... ``` 으로 감싸거나 중첩 escape된 경우 처리
+                data = _robust_json_loads(content)
                 # 빈 JSON 감지: _elapsed_s 외에 유의미한 키가 없으면 재시도
                 meaningful_keys = [k for k in data if k != "_elapsed_s"]
                 if not meaningful_keys:
@@ -311,8 +367,7 @@ class GeminiProvider(LLMProvider):
                     "[LLM RAW] attempt=%d content_len=%d content_preview=%s",
                     attempt, len(raw_text), raw_text[:500],
                 )
-                json_text = _extract_json_from_text(raw_text)
-                data = json.loads(json_text)
+                data = _robust_json_loads(raw_text)
                 # 빈 JSON 감지: _elapsed_s 외에 유의미한 키가 없으면 재시도
                 meaningful_keys = [k for k in data if k != "_elapsed_s"]
                 if not meaningful_keys:
