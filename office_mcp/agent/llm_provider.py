@@ -139,6 +139,13 @@ class OpenAIProvider(LLMProvider):
         self._client = OpenAI(**kwargs)
         self._model = model_name
         self._reasoning_effort = reasoning_effort  # "low", "medium", "high", or None
+        # gpt-5*, o1*, o3* 계열은 max_tokens 미지원 → max_completion_tokens 사용
+        m = (model_name or "").lower()
+        self._max_tokens_key = (
+            "max_completion_tokens"
+            if m.startswith(("gpt-5", "o1", "o3"))
+            else "max_tokens"
+        )
 
     # -- json --
     def call_json(self, prompt_sys: str, prompt_user: str, temperature: float) -> dict:
@@ -181,7 +188,7 @@ class OpenAIProvider(LLMProvider):
                 {"role": "user", "content": prompt_user},
             ],
             "temperature": temperature,
-            "max_tokens": 16384,
+            self._max_tokens_key: 16384,
         }
         if self._reasoning_effort:
             kwargs["extra_body"] = {
@@ -201,7 +208,7 @@ class OpenAIProvider(LLMProvider):
                     "messages": messages,
                     "temperature": temperature,
                     "response_format": {"type": "json_object"},
-                    "max_tokens": 16384,
+                    self._max_tokens_key: 16384,
                 }
                 if self._reasoning_effort:
                     kwargs["extra_body"] = {
