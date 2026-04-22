@@ -2,10 +2,11 @@
 hwpx-mcp 서버 설정.
 
 설계 원칙:
-  - 배포마다 바뀌는 값 (provider 선택, 모델명, base_url, 기능 on/off 등) → .env
-  - 앱 동작 튜닝 상수 (레이아웃, HTTP 타임아웃, 경로 등) → 이 파일
+  - .env: 키, 프로바이더 선택, URL (민감 정보 / 배포 환경별 엔드포인트)
+  - 이 파일: 모델명, 기능 on/off, 타임아웃, 포트 등 앱 동작 상수
 
-폐쇄망(air-gapped) 전환 시 `.env`만 수정하고 컨테이너 재시작하면 됩니다.
+폐쇄망(air-gapped) 전환 시 `.env`에서 OFFICE_MCP_LLM_PROVIDER=custom 과
+CUSTOM_LLM_BASE_URL / CUSTOM_LLM_API_KEY 만 바꾸면 된다.
 """
 
 import os
@@ -37,81 +38,49 @@ def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    v = _env(name)
-    if not v:
-        return default
-    return v.lower() in ("1", "true", "yes", "on", "y", "t")
-
-
-def _env_float(name: str, default: float) -> float:
-    v = _env(name)
-    if not v:
-        return default
-    try:
-        return float(v)
-    except ValueError:
-        return default
-
-
-def _env_int(name: str, default: int) -> int:
-    v = _env(name)
-    if not v:
-        return default
-    try:
-        return int(v)
-    except ValueError:
-        return default
-
-
 def _env_optional(name: str) -> str | None:
     v = _env(name)
     return v or None
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 인프라 / API 키 (민감 정보, .env)
+# .env 로부터 읽어오는 값 (키 / 프로바이더 / URL)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 인프라 URL
 SUPABASE_URL: str = _env("SUPABASE_URL")
-SUPABASE_KEY: str = _env("SUPABASE_KEY")
 MEMENTO_SERVICE_URL: str = _env("MEMENTO_SERVICE_URL", "http://memento-service:8005")
-MEMENTO_DRIVE_FOLDER_ID: str = _env("MEMENTO_DRIVE_FOLDER_ID")
+TAVILY_API_URL: str = _env("TAVILY_API_URL", "https://api.tavily.com/search")
+
+# API Keys
+SUPABASE_KEY: str = _env("SUPABASE_KEY")
 OPENAI_API_KEY: str = _env("OPENAI_API_KEY")
 OPENROUTER_API_KEY: str = _env("OPENROUTER_API_KEY")
 GOOGLE_API_KEY: str = _env("GOOGLE_API_KEY")
 TAVILY_API_KEY: str = _env("TAVILY_API_KEY")
 
+# LLM Provider 선택: openai | openrouter | gemini | custom
+LLM_PROVIDER: str = _env("OFFICE_MCP_LLM_PROVIDER", "openrouter").lower()
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# LLM 설정 (.env)
-#   LLM_PROVIDER 로 선택: openai | openrouter | gemini | custom
-#   provider별 모델명은 *_LLM_MODEL (네임스페이스 분리 — 모두 공존 가능)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-LLM_PROVIDER: str = _env("LLM_PROVIDER", "openrouter").lower()
-
-# Provider별 모델명 (기본값은 과거 config.py 값 유지)
-OPENAI_MODEL_NAME: str = _env("OPENAI_LLM_MODEL", "gpt-5.1")
-OPENROUTER_MODEL_NAME: str = _env("OPENROUTER_LLM_MODEL", "openai/gpt-oss-120b")
-GEMINI_MODEL_NAME: str = _env("GEMINI_LLM_MODEL", "gemini-3.1-flash-image-preview")
-LLM_CUSTOM_MODEL_NAME: str = _env("CUSTOM_LLM_MODEL")
-
-# Custom provider용 URL / API key (폐쇄망).
-# 주의: LLM_PROVIDER=custom 일 때만 채워 넣는다. 그 외 provider는 SDK 기본 URL을 써야 하므로
-#       여기 값이 섞이면 openrouter/openai 호출이 엉뚱한 호스트로 간다.
+# Custom provider (폐쇄망) URL + key
+# 주의: LLM_PROVIDER=custom 일 때만 쓰인다. openrouter/openai 호출에 섞이면 안 된다.
 if LLM_PROVIDER == "custom":
-    LLM_BASE_URL: str | None = _env_optional("CUSTOM_LLM_BASE_URL") or _env_optional("LLM_BASE_URL")
-    LLM_API_KEY: str = _env("CUSTOM_LLM_API_KEY") or _env("LLM_API_KEY")
+    LLM_BASE_URL: str | None = _env_optional("CUSTOM_LLM_BASE_URL")
+    LLM_API_KEY: str = _env("CUSTOM_LLM_API_KEY")
 else:
     LLM_BASE_URL = None
     LLM_API_KEY = ""
 
-# 공통 타임아웃
-LLM_TIMEOUT_SECONDS: float = _env_float("LLM_TIMEOUT_SECONDS", 600.0)
 
-# OpenRouter reasoning effort: "low" | "medium" | "high" | None
-REASONING_EFFORT: str | None = _env_optional("REASONING_EFFORT") or "low"
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 앱 상수 (코드에서 관리 — 배포마다 바뀌지 않음)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# 최종 모델명 결정 (LLM_PROVIDER에 따라 자동 선택)
+# Provider별 모델명 (LLM_PROVIDER 에 따라 자동 선택)
+OPENAI_MODEL_NAME: str = "gpt-5.1"
+OPENROUTER_MODEL_NAME: str = "openai/gpt-oss-120b"
+GEMINI_MODEL_NAME: str = "gemini-3.1-flash-image-preview"
+LLM_CUSTOM_MODEL_NAME: str = "/models/openai/gpt-oss-120b"
+
 _MODEL_MAP = {
     "openai": OPENAI_MODEL_NAME,
     "openrouter": OPENROUTER_MODEL_NAME,
@@ -120,34 +89,27 @@ _MODEL_MAP = {
 }
 MODEL_NAME: str = _MODEL_MAP.get(LLM_PROVIDER, OPENAI_MODEL_NAME)
 
+# LLM 공통
+LLM_TIMEOUT_SECONDS: float = 600.0
+REASONING_EFFORT: str | None = "low"  # "low" | "medium" | "high" | None
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 기능 On/Off (.env — 배포 환경별로 다를 수 있음)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-LLM_VISION_ENABLED: bool = _env_bool("LLM_VISION_ENABLED", False)
-WEB_SEARCH_ENABLED: bool = _env_bool("WEB_SEARCH_ENABLED", False)
-IMAGE_GENERATION_ENABLED: bool = _env_bool("IMAGE_GENERATION_ENABLED", False)
-IMAGE_REFERENCE_ENABLED: bool = _env_bool("IMAGE_REFERENCE_ENABLED", False)
-VISION_CHUNK_PLAN_ENABLED: bool = _env_bool("VISION_CHUNK_PLAN_ENABLED", False)
+# 기능 On/Off
+LLM_VISION_ENABLED: bool = False
+WEB_SEARCH_ENABLED: bool = False
+IMAGE_GENERATION_ENABLED: bool = False
+IMAGE_REFERENCE_ENABLED: bool = False
+VISION_CHUNK_PLAN_ENABLED: bool = False
 
+# 이미지 생성 (Gemini)
+GEMINI_IMAGE_MODEL: str = "gemini-3.1-flash-image-preview"
+GEMINI_IMAGE_TIMEOUT_SECONDS: float = 120.0
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 이미지 생성 설정 (.env)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-GEMINI_IMAGE_MODEL: str = _env("GEMINI_IMAGE_MODEL", "gemini-3.1-flash-image-preview")
-GEMINI_IMAGE_TIMEOUT_SECONDS: float = _env_float("GEMINI_IMAGE_TIMEOUT_SECONDS", 120.0)
+# 서버
+SERVER_PORT: int = 1192
 
+# Memento
+MEMENTO_DRIVE_FOLDER_ID: str = "1hUBPAOp-UVUicb-X_Cd69bbWGi4_vvM1"
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 서버 / 외부 URL (.env)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SERVER_PORT: int = _env_int("SERVER_PORT", 1192)
-TAVILY_API_URL: str = _env("TAVILY_API_URL", "https://api.tavily.com/search")
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 앱 튜닝 상수 (코드에서 관리 — 배포마다 바뀌지 않음)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # HTTP 타임아웃
 HTTP_TIMEOUT_SHORT: float = 30.0   # 파일 다운로드, 검색 API 등
 HTTP_TIMEOUT_LONG: float = 60.0    # 대용량 파일 다운로드, MCP 내부 호출

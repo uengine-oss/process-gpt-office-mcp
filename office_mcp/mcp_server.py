@@ -16,7 +16,7 @@ from fastmcp import FastMCP
 from pydantic import Field
 from supabase import create_client
 
-from .config import DEBUG_OUTPUT_DIR, DEBUG_OUTPUT_ENABLED, LOG_PATH
+from .config import DEBUG_OUTPUT_DIR, DEBUG_OUTPUT_ENABLED, IMAGE_GENERATION_ENABLED, LLM_PROVIDER, LOG_PATH
 from .formats.hwpx.runner import process_hwpx_file
 from .formats.hwpx.hwpx_to_html import hwpx_to_html
 from .formats.hwpx.hwpx_edit import apply_html_edits_to_hwpx
@@ -979,7 +979,19 @@ async def save_docx_from_html(
     }
 
 
-@mcp.tool
+# generate_slides 는 Gemini 이미지 생성에 의존하므로, 이미지 생성이 꺼져 있거나
+# LLM provider가 gemini가 아니면(폐쇄망 등) 도구 자체를 등록하지 않는다.
+_SLIDE_TOOL_ENABLED = bool(IMAGE_GENERATION_ENABLED) and LLM_PROVIDER == "gemini"
+if not _SLIDE_TOOL_ENABLED:
+    logger.info(
+        "generate_slides 도구 비활성화 (IMAGE_GENERATION_ENABLED=%s, LLM_PROVIDER=%s)",
+        IMAGE_GENERATION_ENABLED, LLM_PROVIDER,
+    )
+
+_slide_tool_decorator = mcp.tool if _SLIDE_TOOL_ENABLED else (lambda f: f)
+
+
+@_slide_tool_decorator
 async def generate_slides(
     report_markdown: Annotated[Optional[str], Field(description="보고서 마크다운 (이 값이 있으면 markdown 기반으로 슬라이드 생성)")] = "",
     hwpx_html_url: Annotated[Optional[str], Field(description="이전에 generate_hwpx로 생성한 결과의 html_url. 이 값이 있으면 해당 문서 내용을 읽어 슬라이드를 생성하며 report_markdown보다 우선 적용된다.")] = "",
