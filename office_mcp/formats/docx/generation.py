@@ -45,12 +45,162 @@ def _format_table_template(headers: List, row_samples: List) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Structured output schemas (OpenAI json_schema / Gemini response_schema 호환)
+# ---------------------------------------------------------------------------
+
+_CONFIDENCE_NUMBER = {"type": "number", "minimum": 0, "maximum": 1}
+
+_SCHEMA_TABLE_TYPE = {
+    "name": "table_type_classification",
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "type": {"type": "string", "enum": ["meta", "analytical", "mixed"]},
+            "confidence": _CONFIDENCE_NUMBER,
+            "rationale": {"type": "string"},
+        },
+        "required": ["type", "confidence", "rationale"],
+    },
+}
+
+_SCHEMA_KEY_VALUE_NO_HEADER = {
+    "name": "key_value_no_header_classification",
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "key_value_no_header": {"type": "boolean"},
+            "confidence": _CONFIDENCE_NUMBER,
+            "rationale": {"type": "string"},
+        },
+        "required": ["key_value_no_header", "confidence", "rationale"],
+    },
+}
+
+_SCHEMA_OPTIONAL_SECTIONS = {
+    "name": "optional_section_classification",
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "sections": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "id": {"type": "string"},
+                        "optional": {"type": "boolean"},
+                        "explicit_optional": {"type": "boolean"},
+                        "confidence": _CONFIDENCE_NUMBER,
+                    },
+                    "required": ["id", "optional", "explicit_optional", "confidence"],
+                },
+            },
+        },
+        "required": ["sections"],
+    },
+}
+
+_SCHEMA_SECTION_ROLE = {
+    "name": "section_role_classification",
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "role": {"type": "string", "enum": ["container", "table_only", "body"]},
+            "confidence": _CONFIDENCE_NUMBER,
+            "rationale": {"type": "string"},
+        },
+        "required": ["role", "confidence", "rationale"],
+    },
+}
+
+_SCHEMA_COVER = {
+    "name": "cover_extraction",
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "title_index": {"type": "integer"},
+            "subtitle_index": {"type": "integer"},
+            "title_text": {"type": "string"},
+            "subtitle_text": {"type": "string"},
+            "confidence": _CONFIDENCE_NUMBER,
+            "rationale": {"type": "string"},
+        },
+        "required": ["title_index", "subtitle_index", "title_text", "subtitle_text", "confidence", "rationale"],
+    },
+}
+
+_SCHEMA_SECTION_FILL = {
+    "name": "section_fill",
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "status": {"type": "string", "enum": ["fill", "partial", "omit"]},
+            "content": {"type": "string"},
+        },
+        "required": ["status", "content"],
+    },
+}
+
+_SCHEMA_TABLE_FILL = {
+    "name": "table_fill",
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "status": {"type": "string", "enum": ["fill", "partial", "omit"]},
+            "rows": {
+                "type": "array",
+                "items": {"type": "array", "items": {"type": "string"}},
+            },
+            "headers": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["status", "rows"],
+    },
+}
+
+_SCHEMA_IMAGES = {
+    "name": "image_suggestions",
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "images": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "section_id": {"type": "string"},
+                        "prompt": {"type": "string"},
+                        "caption": {"type": "string"},
+                    },
+                    "required": ["section_id", "prompt", "caption"],
+                },
+            },
+        },
+        "required": ["images"],
+    },
+}
+
+
+# ---------------------------------------------------------------------------
 # Async LLM wrapper
 # ---------------------------------------------------------------------------
 
-async def _chat_json(system_prompt: str, user_prompt: str, context: str = "") -> Dict[str, Any]:
-    logger.debug("LLM json call [%s]", context)
-    result = await asyncio.to_thread(_call_llm_json, system_prompt, user_prompt)
+async def _chat_json(
+    system_prompt: str,
+    user_prompt: str,
+    context: str = "",
+    schema: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    logger.debug("LLM json call [%s] schema=%s", context, (schema or {}).get("name"))
+    result = await asyncio.to_thread(_call_llm_json, system_prompt, user_prompt, 0.2, schema)
     return result if isinstance(result, dict) else {}
 
 
@@ -75,6 +225,7 @@ async def _classify_table_type(table: Dict[str, Any]) -> Dict[str, Any]:
             f"row_samples: {json.dumps(samples, ensure_ascii=False)}\n"
         ),
         context=f"table_type:{table.get('id') or 'unknown'}",
+        schema=_SCHEMA_TABLE_TYPE,
     )
     table_type = data.get("type")
     if table_type not in ("meta", "analytical", "mixed"):
@@ -96,6 +247,7 @@ async def _classify_key_value_no_header(table: Dict[str, Any]) -> Dict[str, Any]
             f"row_samples: {json.dumps(samples, ensure_ascii=False)}\n"
         ),
         context=f"kv_header:{table.get('id') or 'unknown'}",
+        schema=_SCHEMA_KEY_VALUE_NO_HEADER,
     )
     return {
         "key_value_no_header": bool(data.get("key_value_no_header")),
@@ -117,6 +269,7 @@ async def _classify_optional_sections(sections: List[Dict[str, Any]]) -> List[Di
             f"{json.dumps(payload, ensure_ascii=False)}\n"
         ),
         context="optional_sections",
+        schema=_SCHEMA_OPTIONAL_SECTIONS,
     )
     sections_out = data.get("sections") if isinstance(data, dict) else None
     if not isinstance(sections_out, list):
@@ -152,6 +305,7 @@ async def _classify_section_role(section: Dict[str, Any], prev_title: str, next_
             f"has_tables: {str(bool(section.get('has_tables'))).lower()}\n"
         ),
         context=f"section_role:{section_id}:{title}",
+        schema=_SCHEMA_SECTION_ROLE,
     )
     role = str(data.get("role") or "").strip().lower()
     if role not in ("container", "table_only", "body"):
@@ -179,6 +333,7 @@ async def _build_cover_output(cover: Dict[str, Any], query: str, outline: List[s
             f"[전체 개요]\n{json.dumps(outline, ensure_ascii=False)}\n"
         ),
         context="cover_title_subtitle",
+        schema=_SCHEMA_COVER,
     )
     return data if isinstance(data, dict) else {}
 
@@ -215,6 +370,7 @@ async def _build_section_output(
             "- status는 fill | partial | omit 중 하나\n- optional=true 섹션은 자료 부족 시 omit\n"
         ),
         context=f"section:{section_id}:{title}",
+        schema=_SCHEMA_SECTION_FILL,
     )
     if not isinstance(data, dict):
         data = {}
@@ -305,6 +461,7 @@ async def _build_table_output(
             "- status는 fill | partial | omit 중 하나\n- rows는 2차원 배열\n"
         ),
         context=f"table:{table_id}:{section_title}",
+        schema=_SCHEMA_TABLE_FILL,
     )
     if not isinstance(data, dict):
         data = {}
@@ -383,6 +540,7 @@ async def _finalize_image_outputs(
             "- section_id는 섹션 본문 목록의 id 중에서만 선택\n- 0~3개로 제한\n"
         ),
         context="image_finalize",
+        schema=_SCHEMA_IMAGES,
     )
     images = data.get("images") if isinstance(data, dict) else None
     if not isinstance(images, list):
@@ -456,31 +614,6 @@ async def _apply_table_classification(tables: List[Dict[str, Any]]) -> None:
             tbl["table_type_confidence"] = float(meta.get("confidence") or 0)
 
 
-# ---------------------------------------------------------------------------
-# Single-call helpers
-# ---------------------------------------------------------------------------
-
-def _compact_schema_for_single_call(schema: Dict[str, Any]) -> Dict[str, Any]:
-    sections = [{
-        "id": s.get("id"), "title": s.get("title"), "level": s.get("level"), "depth": s.get("depth"),
-        "optional": bool(s.get("optional")), "guidance": s.get("guidance") or [],
-        "template_excerpt": (s.get("template_excerpt") or "").strip(),
-        "min_paragraphs": s.get("min_paragraphs"), "max_paragraphs": s.get("max_paragraphs"),
-        "max_chars": s.get("max_chars"), "paragraph_count": len(s.get("paragraph_indices") or []),
-        "has_tables": bool(s.get("has_tables")), "has_children": s.get("has_children"), "role": s.get("role"),
-    } for s in schema.get("sections") or []]
-    tables = [{
-        "id": t.get("id"), "section_id": t.get("section_id"), "section_title": t.get("section_title"),
-        "headers": t.get("headers") or [], "columns": t.get("columns"),
-        "row_samples": t.get("row_samples") or [],
-        "template_text": _format_table_template(t.get("headers") or [], t.get("row_samples") or []),
-        "header_is_data": bool(t.get("header_is_data")), "key_value_no_header": bool(t.get("key_value_no_header")),
-        "table_type": t.get("table_type"), "table_type_confidence": t.get("table_type_confidence"),
-    } for t in schema.get("tables") or []]
-    cover = schema.get("cover") if isinstance(schema.get("cover"), dict) else {}
-    return {"sections": sections, "tables": tables, "cover": cover or {}}
-
-
 def _should_skip_section_by_structure(sec: Dict[str, Any]) -> bool:
     title_text = str(sec.get("title") or "").strip()
     has_paragraphs = bool(sec.get("paragraph_indices"))
@@ -495,186 +628,6 @@ def _should_skip_section_by_structure(sec: Dict[str, Any]) -> bool:
     return False
 
 
-def _normalize_single_call_sections(sections: List[Dict[str, Any]], raw_sections: Any) -> Dict[str, Dict[str, Any]]:
-    output: Dict[str, Dict[str, Any]] = {}
-    raw_map = raw_sections if isinstance(raw_sections, dict) else {}
-    for sec in sections:
-        sec_id = sec.get("id") or ""
-        if not sec_id:
-            continue
-        optional = bool(sec.get("optional"))
-        max_paragraphs = sec.get("max_paragraphs") or 2
-        content_item = raw_map.get(sec_id)
-        status = "omit" if optional else "partial"
-        text = ""
-        if isinstance(content_item, dict):
-            status = str(content_item.get("status") or status).strip().lower()
-            content_raw = content_item.get("content")
-            text = "\n\n".join(str(i).strip() for i in content_raw if str(i).strip()) if isinstance(content_raw, list) else str(content_raw or "").strip()
-        elif isinstance(content_item, str):
-            text = content_item.strip()
-        if status not in ("fill", "partial", "omit"):
-            status = "omit" if optional else "partial"
-        if not optional and status == "omit":
-            status = "partial"
-        if _should_skip_section_by_structure(sec) or sec.get("role") in ("container", "table_only"):
-            output[sec_id] = {"status": "omit", "content": ""}
-            continue
-        if text:
-            paragraphs = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
-            if max_paragraphs and len(paragraphs) > max_paragraphs:
-                paragraphs = paragraphs[:max_paragraphs]
-            text = "\n\n".join(paragraphs)
-        if not text and not optional:
-            text = "자료가 제한적이어서 간략 요약만 제공합니다."
-            status = "partial"
-        output[sec_id] = {"status": status, "content": text}
-    return output
-
-
-def _infer_table_type(table: Dict[str, Any]) -> str:
-    preset = table.get("table_type")
-    if preset in ("meta", "analytical", "mixed"):
-        return preset
-    if table.get("key_value_no_header") or table.get("header_is_data"):
-        return "meta"
-    section_title = str(table.get("section_title") or "")
-    headers_str = " ".join(str(h) for h in (table.get("headers") or []))
-    if any(kw in section_title for kw in ("지표", "분석", "비교")):
-        return "analytical"
-    if re.search(r"항목\s+[A-Z]|지표\s+[A-Z]|대상\s+[A-Z]", headers_str):
-        return "analytical"
-    return "mixed"
-
-
-def _normalize_single_call_tables(tables: List[Dict[str, Any]], raw_tables: Any) -> Dict[str, Dict[str, Any]]:
-    output: Dict[str, Dict[str, Any]] = {}
-    raw_map = raw_tables if isinstance(raw_tables, dict) else {}
-    for tbl in tables:
-        tbl_id = tbl.get("id") or ""
-        if not tbl_id:
-            continue
-        columns = tbl.get("columns") or len(tbl.get("headers") or []) or 1
-        key_value_no_header = bool(tbl.get("key_value_no_header"))
-        content_item = raw_map.get(tbl_id)
-        status = "partial"
-        rows = []
-        headers = None
-        if isinstance(content_item, dict):
-            status = str(content_item.get("status") or "partial").strip().lower()
-            rows = content_item.get("rows") or []
-            headers = content_item.get("headers")
-        if status not in ("fill", "partial", "omit"):
-            status = "partial"
-        if not isinstance(rows, list):
-            rows = []
-        if isinstance(headers, list):
-            headers = [str(h or "").strip() for h in headers][:columns]
-            if len(headers) < columns:
-                headers = (headers + [""] * columns)[:columns]
-        else:
-            headers = None
-
-        template_rows = tbl.get("row_samples") or []
-        if key_value_no_header and template_rows:
-            if len(rows) > len(template_rows):
-                rows = rows[:len(template_rows)]
-            elif len(rows) < len(template_rows):
-                rows.extend([["", ""]] * (len(template_rows) - len(rows)))
-            for i, tmpl_row in enumerate(template_rows):
-                if not isinstance(rows[i], list):
-                    rows[i] = ["", ""]
-                if len(rows[i]) < columns:
-                    rows[i] = (rows[i] + [""] * columns)[:columns]
-                rows[i][0] = tmpl_row[0]
-
-        table_type = _infer_table_type(tbl)
-        max_cell_chars = 120 if table_type == "meta" and columns <= 2 else (150 if table_type == "analytical" else 140)
-        trimmed_rows = []
-        for row in rows:
-            if not isinstance(row, list):
-                continue
-            new_row = []
-            for cell in row[:columns]:
-                text = re.sub(r"<br\s*/?>", " ", str(cell or "").strip(), flags=re.IGNORECASE)
-                if len(text) > max_cell_chars:
-                    text = text[:max_cell_chars].rstrip()
-                new_row.append(text)
-            while len(new_row) < columns:
-                new_row.append("")
-            trimmed_rows.append(new_row)
-
-        payload: Dict[str, Any] = {"status": status, "rows": trimmed_rows}
-        if headers:
-            payload["headers"] = headers
-        output[tbl_id] = payload
-    return output
-
-
-# ---------------------------------------------------------------------------
-# Single-call entry point
-# ---------------------------------------------------------------------------
-
-async def _build_docx_output_single_call(
-    query: str, outline: List[str], sources_text: str, schema: Dict[str, Any],
-    user_info: Optional[List[Dict[str, Any]]] = None,
-    image_hints: Optional[List[Dict[str, Any]]] = None,
-) -> Dict[str, Any]:
-    compact_schema = _compact_schema_for_single_call(schema)
-    user_info_block = ""
-    if user_info:
-        lines = []
-        for u in user_info:
-            if u.get("name"):
-                lines.append(f"- 이름(작성자): {u['name']}")
-            if u.get("email"):
-                lines.append(f"- 이메일: {u['email']}")
-        user_info_block = "\n".join(lines)
-
-    data = await _chat_json(
-        (
-            "You are a report template filler. The user uploaded a docx template and ran a deep research query. "
-            "Fill the template based on the research sources. Return JSON only."
-        ),
-        (
-            "다음 docx 템플릿 스키마를 참고해 보고서 내용을 채우세요.\n"
-            "- 반드시 JSON만 출력하세요.\n"
-            "- keys: cover, title_mappings, sections, tables, images\n"
-            "- cover: {title_index, subtitle_index, title_text, subtitle_text, confidence, rationale}\n"
-            "- title_mappings: [{section_id, new_title, confidence, rationale}]\n"
-            "- sections: 각 section.id에 대해 {status, content}\n"
-            "- tables: 각 table.id에 대해 {status, rows, headers?}\n"
-            "- images: 0~3개 [{section_id, prompt, caption}]\n\n"
-            f"[사용자 요청]\n{query}\n\n"
-            f"[전체 개요]\n{json.dumps(outline or [], ensure_ascii=False)}\n\n"
-            + (f"[작성자 정보]\n{user_info_block}\n\n" if user_info_block else "")
-            + "memento(내부 문서) 소스를 우선 참고하고, 웹 소스는 보조로만 사용하세요.\n\n"
-            + f"[참고 소스]\n{sources_text or 'N/A'}\n\n"
-            + f"[템플릿 스키마]\n{json.dumps(compact_schema, ensure_ascii=False)}\n"
-        ),
-        context="docx_single_call",
-    )
-    if not isinstance(data, dict):
-        return {}
-
-    # Apply title mappings
-    if isinstance(data.get("title_mappings"), list):
-        title_by_id = {str(m.get("section_id") or ""): m for m in data["title_mappings"] if isinstance(m, dict) and m.get("section_id")}
-        for sec in schema.get("sections") or []:
-            mapped = title_by_id.get(str(sec.get("id") or ""))
-            if mapped and float(mapped.get("confidence") or 0) >= 0.7 and str(mapped.get("new_title") or "").strip():
-                sec["mapped_title"] = str(mapped["new_title"]).strip()
-                sec["title"] = sec["mapped_title"]
-
-    sections_output = _normalize_single_call_sections(schema.get("sections") or [], data.get("sections"))
-    tables_output = _normalize_single_call_tables(schema.get("tables") or [], data.get("tables"))
-    cover_output = data.get("cover") if isinstance(data.get("cover"), dict) else {}
-    images_output = await _finalize_image_outputs(
-        schema.get("sections") or [], sections_output, query, outline, sources_text, image_hints=image_hints
-    )
-    return {"sections": sections_output, "tables": tables_output, "images": images_output, "cover": cover_output}
-
-
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -687,28 +640,25 @@ async def build_docx_output_from_schema(
     user_info: Optional[List[Dict[str, Any]]] = None,
     image_hints: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """Pre-classify schema then generate content via a single LLM call."""
+    """사전 분류(계획) → 노드별 병렬 fill → 결과 취합."""
     await asyncio.gather(
         _apply_optional_sections(schema.get("sections") or []),
         _apply_section_roles(schema.get("sections") or []),
         _apply_table_classification(schema.get("tables") or []),
     )
-    sources_text = _format_sources_for_docx(sources)
-    output = await _build_docx_output_single_call(query, outline, sources_text, schema, user_info=user_info, image_hints=image_hints)
-    if output:
-        return output
-    logger.warning("DOCX 단일 호출 실패, 병렬 LLM 호출로 폴백")
-    return await _build_docx_output_parallel(query, outline, sources, schema, user_info=user_info, image_hints=image_hints)
 
-
-async def _build_docx_output_parallel(
-    query: str, outline: List[str], sources: List[Dict[str, Any]], schema: Dict[str, Any],
-    user_info: Optional[List[Dict[str, Any]]] = None,
-    image_hints: Optional[List[Dict[str, Any]]] = None,
-) -> Dict[str, Any]:
     sources_text = _format_sources_for_docx(sources)
     sections = schema.get("sections") or []
     tables = schema.get("tables") or []
+    sections_to_fill = [
+        s for s in sections
+        if not _should_skip_section_by_structure(s) and s.get("role") not in ("container", "table_only")
+    ]
+    logger.info(
+        "[docx병렬] fill 시작: 섹션 %d개(전체 %d), 표 %d개",
+        len(sections_to_fill), len(sections), len(tables),
+    )
+
     cover_output = await _build_cover_output(schema.get("cover") or {}, query, outline)
     semaphore = asyncio.Semaphore(6)
 
@@ -720,7 +670,6 @@ async def _build_docx_output_parallel(
         async with semaphore:
             return await _build_table_output(tbl, query, sources_text, outline, user_info=user_info)
 
-    sections_to_fill = [s for s in sections if not _should_skip_section_by_structure(s) and s.get("role") not in ("container", "table_only")]
     section_results, table_results = await asyncio.gather(
         asyncio.gather(*[_guarded_section(s) for s in sections_to_fill]),
         asyncio.gather(*[_guarded_table(t) for t in tables]),
@@ -728,4 +677,8 @@ async def _build_docx_output_parallel(
     sections_output = {sec_id: data for sec_id, data in section_results if sec_id}
     tables_output = {tbl_id: data for tbl_id, data in table_results if tbl_id}
     images = await _finalize_image_outputs(sections, sections_output, query, outline, sources_text, image_hints=image_hints)
+    logger.info(
+        "[docx병렬] fill 완료: 섹션 %d, 표 %d, 이미지 %d",
+        len(sections_output), len(tables_output), len(images),
+    )
     return {"sections": sections_output, "tables": tables_output, "images": images, "cover": cover_output}

@@ -67,38 +67,46 @@ def _docs_to_sources(raw_docs: List[Any]) -> List[Dict[str, Any]]:
 # memento HTTP 호출
 # ---------------------------------------------------------------------------
 
-async def _broad_search(query: str, tenant_id: str, top_k: int = 15) -> List[Dict[str, Any]]:
+async def _broad_search(
+    query: str,
+    tenant_id: str,
+    top_k: int = 15,
+    proc_inst_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     url = f"{_get_memento_url()}/retrieve"
+    base_params: Dict[str, Any] = {
+        "query": query,
+        "tenant_id": tenant_id,
+        **_get_drive_folder_param(),
+    }
+    # proc_inst_id 필터가 있으면 전체 검색 대신 해당 프로세스 인스턴스로 범위 제한
+    if proc_inst_id:
+        base_params["proc_inst_id"] = proc_inst_id
+    else:
+        base_params["all_docs"] = "true"
     async with _MEMENTO_SEM:
         async with httpx.AsyncClient(timeout=60) as client:
             try:
-                response = await client.get(
-                    url,
-                    params={
-                        "query": query,
-                        "tenant_id": tenant_id,
-                        "all_docs": "true",
-                        "top_k": top_k,
-                        **_get_drive_folder_param(),
-                    },
-                )
+                response = await client.get(url, params={**base_params, "top_k": top_k})
                 if response.status_code == 422:
                     logger.warning("memento가 top_k 파라미터를 지원하지 않음 → top_k 없이 재시도")
-                    response = await client.get(
-                        url,
-                        params={
-                            "query": query,
-                            "tenant_id": tenant_id,
-                            "all_docs": "true",
-                            **_get_drive_folder_param(),
-                        },
-                    )
+                    response = await client.get(url, params=base_params)
                 response.raise_for_status()
                 data = response.json()
                 return _docs_to_sources(data.get("response") or [])
             except Exception as exc:
                 logger.warning("memento 브로드 검색 실패: %s", exc)
                 return []
+
+
+async def _process_search(
+    query: str,
+    tenant_id: str,
+    proc_inst_id: str,
+    top_k: int = 15,
+) -> List[Dict[str, Any]]:
+    """프로세스 인스턴스(proc_inst_id)에 ingest된 문서만 대상으로 단순 retrieve."""
+    return await _broad_search(query, tenant_id, top_k=top_k, proc_inst_id=proc_inst_id)
 
 
 async def _room_search(query: str, tenant_id: str, room_id: str, top_k: int = 15) -> List[Dict[str, Any]]:
@@ -421,11 +429,15 @@ def _final_review_chunks_with_llm(
 # 공개 API
 # ---------------------------------------------------------------------------
 
-async def search_memento(query: str, tenant_id: str) -> List[Dict[str, Any]]:
+async def search_memento(
+    query: str,
+    tenant_id: str,
+    proc_inst_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """단순 memento 검색 — 유사 청크를 소스 포맷으로 반환."""
     if not tenant_id:
         return []
-    return await _broad_search(query, tenant_id)
+    return await _broad_search(query, tenant_id, proc_inst_id=proc_inst_id)
 
 
 async def search_memento_smart(
@@ -433,19 +445,19 @@ async def search_memento_smart(
     outline: List[str],
     tenant_id: str,
     room_id: Optional[str] = None,
+    proc_inst_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """문서-우선 스마트 Memento 검색.
 
-    room_id가 있으면 채팅방 업로드 문서만 대상으로 단순 /retrieve를 수행하고
-    아래 드라이브 기반 문서 선택 플로우(Step 1~6)는 스킵한다.
+    우선순위:
+      1. room_id 있음 → 채팅방 업로드 문서만 단순 /retrieve
+      2. proc_inst_id 있음 → 해당 프로세스 인스턴스 문서만 단순 /retrieve
+      3. 그 외 → 드라이브 기반 스마트 플로우(Step 1~6, 현재 비활성화 상태)
 
-    드라이브 기반(기존) 플로우:
-    1. 문서 목록 조회 (실패 시 브로드 검색 폴백)
-    2. LLM이 쿼리 기반으로 문서 선택
-    3. 선택된 문서의 청크 메타데이터 조회
-    4. LLM이 outline 기반으로 chunk_index 선택 (title 기반 1차)
-    5. 선택된 청크 content 수신
-    6. LLM이 content 검토 후 최종 선택 (content 기반 2차)
+    드라이브 기반 스마트 플로우는 LLM 3단계 선택(문서 → 청크 index → 내용 검수)을
+    수행하지만 비용이 크고 proc_inst_id 범위 필터가 보편화된 이후 기본 경로에서는
+    호출하지 않는다. 필요 시 `force_smart_drive=True` 의도로 직접 호출하거나
+    아래 드라이브 분기 블록의 `if False:` 게이트를 풀어 활성화한다.
     """
     if not tenant_id:
         return []
@@ -461,6 +473,28 @@ async def search_memento_smart(
             s.pop("_section_title", None)
         logger.info("search_memento_smart(room) 완료: %d 청크", len(room_sources))
         return room_sources
+
+    # 프로세스 시나리오: proc_inst_id에 ingest된 문서만 참조 → 드라이브 선택 단계 스킵
+    if proc_inst_id:
+        logger.info(
+            "search_memento_smart(process) 시작 (query=%s, tenant_id=%s, proc_inst_id=%s)",
+            query, tenant_id, proc_inst_id,
+        )
+        proc_sources = await _process_search(query, tenant_id, proc_inst_id, top_k=15)
+        for s in proc_sources:
+            s.pop("_chunk_index", None)
+            s.pop("_file_name", None)
+            s.pop("_drive_folder_name", None)
+            s.pop("_section_title", None)
+        logger.info("search_memento_smart(process) 완료: %d 청크", len(proc_sources))
+        return proc_sources
+
+    # 드라이브 기반 스마트 플로우는 현재 기본 경로에서 비활성화.
+    # 아래 DRIVE_SMART_ENABLED 를 True 로 바꾸면 Step 1~6 LLM 3단계 선택을 다시 활성화한다.
+    DRIVE_SMART_ENABLED = False
+    if not DRIVE_SMART_ENABLED:
+        logger.info("search_memento_smart: 드라이브 스마트 검색 비활성화 → 빈 결과 반환 (room_id/proc_inst_id 없음)")
+        return []
 
     logger.info("search_memento_smart 시작 (query=%s, tenant_id=%s)", query, tenant_id)
 
@@ -702,22 +736,26 @@ async def search_memento_multi_query(
     tenant_id: str,
     top_k: int = 5,
     file_names: List[str] | None = None,
+    proc_inst_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """여러 쿼리로 memento를 검색하고 중복 제거해 반환한다.
 
     각 쿼리별 top_k개를 가져온 뒤 content 기준으로 중복을 제거한다.
     file_names가 주어지면 해당 문서에서 나온 결과만 반환한다.
+    proc_inst_id가 주어지면 해당 프로세스 인스턴스 문서만 대상으로 검색한다.
     """
     if not tenant_id or not queries:
         return []
 
     filter_desc = ""
     if file_names:
-        filter_desc = f", 문서필터={len(file_names)}개"
+        filter_desc += f", 문서필터={len(file_names)}개"
+    if proc_inst_id:
+        filter_desc += f", proc_inst_id={proc_inst_id}"
     logger.info("[청크RAG] %d개 쿼리로 memento 검색 시작 (top_k=%d%s)", len(queries), top_k, filter_desc)
 
     # 모든 쿼리를 병렬로 검색
-    tasks = [_broad_search(q, tenant_id, top_k=top_k) for q in queries]
+    tasks = [_broad_search(q, tenant_id, top_k=top_k, proc_inst_id=proc_inst_id) for q in queries]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     # 파일명 필터 준비 (부분 매칭: 선택 문서명이 결과 파일명에 포함되면 통과)

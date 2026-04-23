@@ -67,6 +67,36 @@ def _find_balanced_json(text: str) -> dict | None:
     return None
 
 
+def _recover_empty_key_wrapper(text: str) -> dict | None:
+    """gpt-oss 계열이 내놓는 외곽 wrapper 형태를 복원.
+
+    모델이 실제 JSON을 `{ "": "frag1", "": "frag2", ... }` 중복 빈 키로 감싸서
+    반환하는 경우가 있다. 외곽 `{\\n{` 이중 중괄호를 풀고, 각 빈 키 value를
+    이어붙인 뒤 JSON으로 재파싱한다.
+    """
+    t = re.sub(r"^\s*\{\s*\n\s*\{", "{", text)
+    # 모델이 string 종료 쿼트 대신 `\"\"`를 찍는 경우 복구
+    t = re.sub(r'\\"\\"\s*\n?\s*(\}\s*)$', r'"\1', t)
+    try:
+        pairs = json.JSONDecoder(strict=False, object_pairs_hook=list).decode(t)
+    except Exception:
+        return None
+    if not isinstance(pairs, list) or not pairs:
+        return None
+    fragments = [v for k, v in pairs if k == "" and isinstance(v, str)]
+    if len(fragments) < 2:
+        return None
+    joined = "".join(fragments)
+    for extra in ("", "}", "\n}"):
+        try:
+            result = json.loads(joined + extra, strict=False)
+        except Exception:
+            continue
+        if isinstance(result, dict):
+            return result
+    return None
+
+
 def _robust_json_loads(text: str) -> dict:
     """LLM 응답에서 JSON을 최대한 회복시켜 파싱.
 
@@ -87,6 +117,10 @@ def _robust_json_loads(text: str) -> dict:
     found = _find_balanced_json(unescaped)
     if found is not None:
         return found
+    # 3) gpt-oss 계열의 빈 키 wrapper 패턴 복원
+    found = _recover_empty_key_wrapper(raw)
+    if found is not None:
+        return found
     # 회복 실패 — 원 에러 재발생
     return json.loads(raw)
 
@@ -94,10 +128,24 @@ def _robust_json_loads(text: str) -> dict:
 # ── Abstract base ──
 
 class LLMProvider(ABC):
-    """Three-method contract for LLM backends."""
+    """Three-method contract for LLM backends.
+
+    `schema`가 주어지면 provider-native structured output(OpenAI json_schema /
+    Gemini response_schema)을 사용해 모델이 해당 스키마만 생성하도록 강제한다.
+    형식은 OpenAI 규격:
+        {"name": "<id>", "schema": {<JSON Schema object>}}
+    strict 모드는 provider가 지원하면 기본 활성화한다. schema=None이면 기존의
+    자유형 JSON 출력으로 폴백한다.
+    """
 
     @abstractmethod
-    def call_json(self, prompt_sys: str, prompt_user: str, temperature: float) -> dict:
+    def call_json(
+        self,
+        prompt_sys: str,
+        prompt_user: str,
+        temperature: float,
+        schema: dict | None = None,
+    ) -> dict:
         ...
 
     @abstractmethod
@@ -107,6 +155,7 @@ class LLMProvider(ABC):
         prompt_user: str,
         images_b64: list[str],
         temperature: float,
+        schema: dict | None = None,
     ) -> dict:
         ...
 
@@ -148,13 +197,20 @@ class OpenAIProvider(LLMProvider):
         )
 
     # -- json --
-    def call_json(self, prompt_sys: str, prompt_user: str, temperature: float) -> dict:
+    def call_json(
+        self,
+        prompt_sys: str,
+        prompt_user: str,
+        temperature: float,
+        schema: dict | None = None,
+    ) -> dict:
         return self._do_json(
             messages=[
                 {"role": "system", "content": prompt_sys},
                 {"role": "user", "content": prompt_user},
             ],
             temperature=temperature,
+            schema=schema,
         )
 
     # -- vision json --
@@ -164,6 +220,7 @@ class OpenAIProvider(LLMProvider):
         prompt_user: str,
         images_b64: list[str],
         temperature: float,
+        schema: dict | None = None,
     ) -> dict:
         user_content: list[dict] = [{"type": "text", "text": prompt_user}]
         for img in images_b64:
@@ -177,6 +234,7 @@ class OpenAIProvider(LLMProvider):
                 {"role": "user", "content": user_content},
             ],
             temperature=temperature,
+            schema=schema,
         )
 
     # -- text --
@@ -198,16 +256,35 @@ class OpenAIProvider(LLMProvider):
         return resp.choices[0].message.content or ""
 
     # -- internal --
-    def _do_json(self, messages: list[dict], temperature: float) -> dict:
+    def _build_response_format(self, schema: dict | None) -> dict:
+        """Structured Outputs (json_schema)를 우선 사용하고, 없으면 json_object로 폴백."""
+        if schema and isinstance(schema.get("schema"), dict):
+            return {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema.get("name") or "response",
+                    "strict": True,
+                    "schema": schema["schema"],
+                },
+            }
+        return {"type": "json_object"}
+
+    def _do_json(
+        self,
+        messages: list[dict],
+        temperature: float,
+        schema: dict | None = None,
+    ) -> dict:
         started = time.perf_counter()
         last_exc = None
+        response_format = self._build_response_format(schema)
         for attempt in range(1, _MAX_RETRIES + 1):
             try:
                 kwargs: dict = {
                     "model": self._model,
                     "messages": messages,
                     "temperature": temperature,
-                    "response_format": {"type": "json_object"},
+                    "response_format": response_format,
                     self._max_tokens_key: 16384,
                 }
                 if self._reasoning_effort:
@@ -220,38 +297,22 @@ class OpenAIProvider(LLMProvider):
                 content_parts: list[str] = []
                 reasoning_parts: list[str] = []
                 finish_reason = "stop"
-                _reasoning_started = False
-                _content_started = False
                 for chunk in stream:
                     delta = chunk.choices[0].delta if chunk.choices else None
                     if delta:
-                        # reasoning 토큰
                         rc = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
                         if rc:
-                            if not _reasoning_started:
-                                print(f"\n{'='*60}\n[LLM REASONING 시작]", flush=True)
-                                _reasoning_started = True
-                            print(rc, end="", flush=True)
                             reasoning_parts.append(rc)
-                        # 본문 토큰
                         if delta.content:
-                            if not _content_started:
-                                if _reasoning_started:
-                                    print(f"\n[LLM REASONING 끝]\n{'='*60}", flush=True)
-                                print(f"[LLM CONTENT 시작]", flush=True)
-                                _content_started = True
-                            print(delta.content, end="", flush=True)
                             content_parts.append(delta.content)
                     if chunk.choices and chunk.choices[0].finish_reason:
                         finish_reason = chunk.choices[0].finish_reason
-                if _content_started:
-                    print(f"\n[LLM CONTENT 끝]\n{'='*60}", flush=True)
 
                 elapsed = time.perf_counter() - started
                 content = "".join(content_parts) or "{}"
                 reasoning_text = "".join(reasoning_parts)
                 if reasoning_text:
-                    logger.info("[LLM REASONING] len=%d", len(reasoning_text))
+                    logger.info("[LLM REASONING] len=%d\n%s", len(reasoning_text), reasoning_text)
                 logger.info(
                     "[LLM RAW] attempt=%d finish_reason=%s content_len=%d\n%s",
                     attempt, finish_reason, len(content), content,
@@ -308,8 +369,14 @@ class GeminiProvider(LLMProvider):
         self._types = genai_types
 
     # -- json --
-    def call_json(self, prompt_sys: str, prompt_user: str, temperature: float) -> dict:
-        return self._do_json(prompt_sys, prompt_user, temperature)
+    def call_json(
+        self,
+        prompt_sys: str,
+        prompt_user: str,
+        temperature: float,
+        schema: dict | None = None,
+    ) -> dict:
+        return self._do_json(prompt_sys, prompt_user, temperature, schema=schema)
 
     # -- vision json --
     def call_vision_json(
@@ -318,8 +385,9 @@ class GeminiProvider(LLMProvider):
         prompt_user: str,
         images_b64: list[str],
         temperature: float,
+        schema: dict | None = None,
     ) -> dict:
-        return self._do_json(prompt_sys, prompt_user, temperature, images_b64=images_b64)
+        return self._do_json(prompt_sys, prompt_user, temperature, images_b64=images_b64, schema=schema)
 
     # -- text --
     def call_text(self, prompt_sys: str, prompt_user: str, temperature: float) -> str:
@@ -341,6 +409,7 @@ class GeminiProvider(LLMProvider):
         prompt_user: str,
         temperature: float,
         images_b64: list[str] | None = None,
+        schema: dict | None = None,
     ) -> dict:
         import base64
 
@@ -353,11 +422,14 @@ class GeminiProvider(LLMProvider):
                     self._types.Part.from_bytes(data=img_bytes, mime_type="image/png")
                 )
 
-        config = self._types.GenerateContentConfig(
-            system_instruction=prompt_sys,
-            temperature=temperature,
-            response_mime_type="application/json",
-        )
+        config_kwargs: dict = {
+            "system_instruction": prompt_sys,
+            "temperature": temperature,
+            "response_mime_type": "application/json",
+        }
+        if schema and isinstance(schema.get("schema"), dict):
+            config_kwargs["response_schema"] = schema["schema"]
+        config = self._types.GenerateContentConfig(**config_kwargs)
 
         started = time.perf_counter()
         last_exc = None

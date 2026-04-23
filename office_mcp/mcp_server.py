@@ -43,10 +43,9 @@ from .formats.slides.generation import (
 
 
 class _SuppressLlmFilter(logging.Filter):
-    """stream handler에서 LLM 요청/응답 로그를 숨긴다. 파일에는 그대로 기록."""
+    """stream handler에서 LLM 관련 로그(요청/응답/raw/reasoning 등)를 숨긴다. 파일에는 그대로 기록."""
     def filter(self, record: logging.LogRecord) -> bool:
-        msg = record.getMessage()
-        return "[LLM REQUEST]" not in msg and "[LLM RESPONSE]" not in msg
+        return "[LLM " not in record.getMessage()
 
 
 def _setup_logging() -> logging.Logger:
@@ -367,6 +366,7 @@ async def generate_hwpx(
     user_uid: Annotated[Optional[str], Field(description="사용자 UID (자동 주입)")] = "",
     user_email: Annotated[Optional[str], Field(description="사용자 이메일 (자동 주입)")] = "",
     room_id: Annotated[Optional[str], Field(description="채팅방 ID (자동 주입). 있으면 방에 업로드된 문서만 참조하며 드라이브 검색을 스킵한다.")] = "",
+    proc_inst_id: Annotated[Optional[str], Field(description="프로세스 인스턴스 ID. 있으면 해당 프로세스에 ingest된 문서만 참조한다.")] = "",
 ) -> dict:
     """HWPX 템플릿을 채워 스토리지 URL로 반환한다.
 
@@ -414,12 +414,13 @@ async def generate_hwpx(
                 )
                 logger.info("generate_hwpx: 선택 문서 기반 검색 완료 (%d개 소스)", len(memento_sources))
             else:
-                # room_id가 있으면 방 문서만, 없으면 전체 드라이브에서 스마트 검색
+                # room_id > proc_inst_id > (드라이브 스마트는 현재 비활성) 순으로 분기
                 memento_sources = await search_memento_smart(
                     query=report_topic,
                     outline=[report_description] if report_description else [report_topic],
                     tenant_id=tenant_id.strip(),
                     room_id=(room_id or "").strip() or None,
+                    proc_inst_id=(proc_inst_id or "").strip() or None,
                 )
 
             if memento_sources:
@@ -474,6 +475,7 @@ async def generate_hwpx(
             image_generation_enabled=image_generation_enabled,
             image_reference_enabled=image_reference_enabled,
             source_chunks=source_chunks or None,
+            proc_inst_id=(proc_inst_id or "").strip() or None,
         )
 
         if DEBUG_OUTPUT_ENABLED:
@@ -696,6 +698,7 @@ async def generate_docx(
     user_uid: Annotated[Optional[str], Field(description="사용자 UID (자동 주입)")] = "",
     user_email: Annotated[Optional[str], Field(description="사용자 이메일 (자동 주입)")] = "",
     room_id: Annotated[Optional[str], Field(description="채팅방 ID (자동 주입). 있으면 방에 업로드된 문서만 참조하며 드라이브 검색을 스킵한다.")] = "",
+    proc_inst_id: Annotated[Optional[str], Field(description="프로세스 인스턴스 ID. 있으면 해당 프로세스에 ingest된 문서만 참조한다.")] = "",
 ) -> dict:
     """DOCX 템플릿을 LLM으로 채워 스토리지 URL로 반환한다.
 
@@ -724,6 +727,7 @@ async def generate_docx(
                 outline=outline if outline else [query],
                 tenant_id=tenant_id.strip(),
                 room_id=(room_id or "").strip() or None,
+                proc_inst_id=(proc_inst_id or "").strip() or None,
             )
             if memento_sources:
                 sources = memento_sources + sources
@@ -1007,6 +1011,7 @@ async def generate_slides(
     user_uid: Annotated[Optional[str], Field(description="사용자 UID (자동 주입)")] = "",
     user_email: Annotated[Optional[str], Field(description="사용자 이메일 (자동 주입)")] = "",
     room_id: Annotated[Optional[str], Field(description="채팅방 ID (자동 주입). 있으면 방에 업로드된 문서만 참조한다.")] = "",
+    proc_inst_id: Annotated[Optional[str], Field(description="프로세스 인스턴스 ID. 있으면 해당 프로세스에 ingest된 문서만 참조한다.")] = "",
 ) -> dict:
     """슬라이드 마크다운과 이미지를 생성해 반환한다.
 
@@ -1054,6 +1059,7 @@ async def generate_slides(
                     outline=outline if outline else [research_goal],
                     tenant_id=tenant_id.strip(),
                     room_id=(room_id or "").strip() or None,
+                    proc_inst_id=(proc_inst_id or "").strip() or None,
                 )
                 if memento_sources:
                     sources = memento_sources + sources

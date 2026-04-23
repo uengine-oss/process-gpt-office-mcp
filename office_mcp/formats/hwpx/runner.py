@@ -352,6 +352,7 @@ async def process_hwpx_file(
     image_generation_enabled: bool | None = None,
     image_reference_enabled: bool | None = None,
     source_chunks: list[dict] | None = None,
+    proc_inst_id: str | None = None,
 ) -> str:
     if not report_topic:
         raise ValueError("report_topic is required")
@@ -520,6 +521,7 @@ async def process_hwpx_file(
                             rag_sources = await search_memento_multi_query(
                                 rag_queries, tenant_id.strip(), top_k=5,
                                 file_names=selected_file_names,
+                                proc_inst_id=(proc_inst_id or "").strip() or None,
                             )
                             if rag_sources:
                                 rag_text = sources_to_reference_text(rag_sources)

@@ -43,10 +43,16 @@ _CHUNK_PLAN_SCHEMA = {
 
 # ── 통합 인터페이스 (provider에 위임) ──
 
-def _call_llm_json(prompt_sys: str, prompt_user: str, temperature: float = 0.2) -> dict:
+def _call_llm_json(
+    prompt_sys: str,
+    prompt_user: str,
+    temperature: float = 0.2,
+    schema: dict | None = None,
+) -> dict:
     started = time.perf_counter()
-    logger.info("[LLM REQUEST] temp=%.2f\n[SYSTEM]\n%s\n[USER]\n%s", temperature, prompt_sys, prompt_user)
-    data = _provider.call_json(prompt_sys, prompt_user, temperature)
+    schema_tag = f" schema={schema.get('name')}" if schema else ""
+    logger.info("[LLM REQUEST]%s temp=%.2f\n[SYSTEM]\n%s\n[USER]\n%s", schema_tag, temperature, prompt_sys, prompt_user)
+    data = _provider.call_json(prompt_sys, prompt_user, temperature, schema=schema)
     elapsed = time.perf_counter() - started
     logger.info("[LLM RESPONSE] elapsed=%.2fs\n%s", elapsed, json.dumps(data, ensure_ascii=False, indent=2))
     return data
@@ -57,19 +63,21 @@ def _call_llm_vision_json(
     prompt_user: str,
     images_b64: list[str],
     temperature: float = 0.2,
+    schema: dict | None = None,
 ) -> dict:
     from ..config import LLM_VISION_ENABLED
 
     if not LLM_VISION_ENABLED:
         logger.info("[LLM VISION → TEXT fallback] LLM_VISION_ENABLED=false, 이미지 %d장 무시", len(images_b64))
-        return _call_llm_json(prompt_sys, prompt_user, temperature)
+        return _call_llm_json(prompt_sys, prompt_user, temperature, schema=schema)
 
     started = time.perf_counter()
+    schema_tag = f" schema={schema.get('name')}" if schema else ""
     logger.info(
-        "[LLM VISION REQUEST] temp=%.2f images=%d\n[SYSTEM]\n%s\n[USER text]\n%s...",
-        temperature, len(images_b64), prompt_sys, prompt_user[:500],
+        "[LLM VISION REQUEST]%s temp=%.2f images=%d\n[SYSTEM]\n%s\n[USER text]\n%s...",
+        schema_tag, temperature, len(images_b64), prompt_sys, prompt_user[:500],
     )
-    data = _provider.call_vision_json(prompt_sys, prompt_user, images_b64, temperature)
+    data = _provider.call_vision_json(prompt_sys, prompt_user, images_b64, temperature, schema=schema)
     elapsed = time.perf_counter() - started
     logger.info("[LLM VISION RESPONSE] elapsed=%.2fs\n%s", elapsed, json.dumps(data, ensure_ascii=False, indent=2))
     return data
