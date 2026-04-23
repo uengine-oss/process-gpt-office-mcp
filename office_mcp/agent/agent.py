@@ -7,7 +7,7 @@ from typing import Any
 from ..models import TextNode, TableSummary
 from .llm_provider import create_provider
 
-logger = logging.getLogger("process-gpt-office-mcp")
+logger = logging.getLogger(__name__)
 
 # ── Provider 초기화 (LLM_PROVIDER 설정에 따라 자동 선택) ──
 _provider = create_provider()

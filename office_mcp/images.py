@@ -17,7 +17,7 @@ _GOV_STYLE_GUIDE = (
     "플랫 벡터, 파스텔 톤, 과도한 장식 없음. "
     "아이콘/도형 위주, 텍스트 최소화, 읽기 쉬운 레이아웃."
 )
-logger = logging.getLogger("process-gpt-office-mcp")
+logger = logging.getLogger(__name__)
 
 
 def _list_bindata_images(extract_dir: str) -> List[Path]:

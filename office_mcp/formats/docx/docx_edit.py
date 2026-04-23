@@ -22,7 +22,7 @@ NS = {
 }
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
-logger = logging.getLogger("process-gpt-office-mcp")
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------

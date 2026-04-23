@@ -14,7 +14,7 @@ import httpx
 
 from .agent.agent import _call_llm_json
 
-logger = logging.getLogger("process-gpt-office-mcp")
+logger = logging.getLogger(__name__)
 
 # memento 동시 요청 제한 (과도한 병렬 요청으로 인한 타임아웃 방지)
 _MEMENTO_SEM = asyncio.Semaphore(5)
@@ -438,6 +438,32 @@ async def search_memento(
     if not tenant_id:
         return []
     return await _broad_search(query, tenant_id, proc_inst_id=proc_inst_id)
+
+
+async def search_section_context(
+    query: str,
+    tenant_id: str,
+    room_id: Optional[str] = None,
+    proc_inst_id: Optional[str] = None,
+    top_k: int = 5,
+) -> List[Dict[str, Any]]:
+    """섹션별 보조 검색. room_id 또는 proc_inst_id 범위로 단순 /retrieve 한 번."""
+    if not tenant_id or not query.strip():
+        return []
+    room = (room_id or "").strip()
+    proc = (proc_inst_id or "").strip()
+    if room:
+        sources = await _room_search(query, tenant_id, room, top_k=top_k)
+    elif proc:
+        sources = await _process_search(query, tenant_id, proc, top_k=top_k)
+    else:
+        return []
+    for s in sources:
+        s.pop("_chunk_index", None)
+        s.pop("_file_name", None)
+        s.pop("_drive_folder_name", None)
+        s.pop("_section_title", None)
+    return sources
 
 
 async def search_memento_smart(

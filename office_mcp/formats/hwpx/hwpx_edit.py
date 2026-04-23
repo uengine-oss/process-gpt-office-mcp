@@ -10,7 +10,7 @@ from ...core.xml_utils import tag as core_tag
 from ...io.file import extract_hwpx, find_section_files, repack_hwpx
 
 
-logger = logging.getLogger("process-gpt-office-mcp")
+logger = logging.getLogger(__name__)
 
 
 def _collect_tables_in_order(root: ET.Element) -> list[ET.Element]:

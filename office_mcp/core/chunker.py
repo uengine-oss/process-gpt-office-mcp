@@ -2,7 +2,7 @@ import logging
 import re
 from ..models import TextNode
 
-logger = logging.getLogger("process-gpt-office-mcp")
+logger = logging.getLogger(__name__)
 
 # ── 청크 크기 제한 ──
 _MAX_CHUNK_NODES = 120   # 이 이상이면 이어붙이지 않음

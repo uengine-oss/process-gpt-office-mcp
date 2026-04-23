@@ -22,7 +22,7 @@ from supabase import create_client
 from ...images import generate_image_gemini
 from ...config import IMAGE_GENERATION_ENABLED
 
-logger = logging.getLogger("process-gpt-office-mcp")
+logger = logging.getLogger(__name__)
 
 PLACEHOLDER_PATTERN = re.compile(r"\[[^\[\]]+?\]")
 HEADING_NUMBER_PATTERN = re.compile(r"^\s*\d+(\.\d+)*\s+")
@@ -187,7 +187,6 @@ def extract_template_schema(doc: Document) -> Dict[str, Any]:
     tables: List[Dict[str, Any]] = []
     current = None
     index_map = {para._p: idx for idx, para in enumerate(doc.paragraphs)}
-    max_excerpt_chars = 800
     cover_paragraphs: List[Dict[str, Any]] = []
     cover_tables: List[Dict[str, Any]] = []
     cover_active = True
@@ -232,7 +231,7 @@ def extract_template_schema(doc: Document) -> Dict[str, Any]:
         elif isinstance(block, Table):
             table = block
             headers = [cell.text.strip() for cell in table.rows[0].cells] if table.rows else []
-            row_samples = [[cell.text.strip() for cell in row.cells] for row in table.rows[:6]]
+            row_samples = [[cell.text.strip() for cell in row.cells] for row in table.rows]
             if cover_active:
                 cover_tables.append({"index": len(tables), "rows": row_samples})
             key_value_no_header = False
@@ -273,8 +272,6 @@ def extract_template_schema(doc: Document) -> Dict[str, Any]:
         template_texts = sec.get("template_texts") or []
         if template_texts:
             excerpt = "\n\n".join(str(t) for t in template_texts if t).strip()
-            if len(excerpt) > max_excerpt_chars:
-                excerpt = excerpt[:max_excerpt_chars].rstrip()
             sec["template_excerpt"] = excerpt
 
     for i, sec in enumerate(sections):
@@ -379,8 +376,8 @@ def apply_schema_output(
             indices = sec.get("paragraph_indices") or []
             if indices:
                 _set_paragraph_text(doc.paragraphs[indices[0]], text)
-                for idx in indices[1:]:
-                    _set_paragraph_text(doc.paragraphs[idx], "")
+                # 형제 placeholder는 건드리지 않는다 — LLM이 섹션 1개로 처리한 경우
+                # 나머지 placeholder는 원본 안내문 그대로 남겨 사용자가 편집할 수 있게 한다.
             else:
                 doc.add_paragraph(text)
 

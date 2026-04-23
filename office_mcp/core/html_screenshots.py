@@ -9,7 +9,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 
-logger = logging.getLogger("process-gpt-office-mcp")
+logger = logging.getLogger(__name__)
 
 
 @dataclass

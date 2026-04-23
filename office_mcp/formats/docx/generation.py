@@ -8,12 +8,32 @@ from typing import Any, Dict, List, Optional, Tuple
 from ...agent.agent import _call_llm_json
 from ...config import IMAGE_GENERATION_ENABLED
 
-logger = logging.getLogger("office-mcp-docx-generation")
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
 # Source / table formatting helpers
 # ---------------------------------------------------------------------------
+
+def _source_fingerprint(item: Dict[str, Any]) -> str:
+    """Dedup key for a retrieved chunk — title + first 120 chars of content."""
+    title = (item.get("title") or "").strip()
+    content = (item.get("content") or "").strip()
+    return f"{title}::{content[:120]}"
+
+
+def _merge_sources(primary: List[Dict[str, Any]], extra: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """primary는 순서 유지, extra에서 fingerprint가 겹치지 않는 항목만 뒤에 덧붙임."""
+    seen = {_source_fingerprint(s) for s in primary}
+    merged = list(primary)
+    for s in extra:
+        fp = _source_fingerprint(s)
+        if fp in seen:
+            continue
+        seen.add(fp)
+        merged.append(s)
+    return merged
+
 
 def _format_sources_for_docx(sources: List[Dict[str, Any]], limit: int = 100) -> str:
     if not sources:
@@ -158,7 +178,6 @@ _SCHEMA_TABLE_FILL = {
                 "type": "array",
                 "items": {"type": "array", "items": {"type": "string"}},
             },
-            "headers": {"type": "array", "items": {"type": "string"}},
         },
         "required": ["status", "rows"],
     },
@@ -339,17 +358,39 @@ async def _build_cover_output(cover: Dict[str, Any], query: str, outline: List[s
 
 
 async def _build_section_output(
-    section: Dict[str, Any], query: str, sources_text: str, outline: Optional[List[str]] = None
+    section: Dict[str, Any],
+    query: str,
+    base_sources: List[Dict[str, Any]],
+    outline: Optional[List[str]] = None,
+    section_rag=None,
 ) -> Tuple[str, Dict[str, Any]]:
     section_id = section.get("id") or ""
     title = section.get("title") or section_id
     optional = bool(section.get("optional"))
     guidance = section.get("guidance") or []
     template_excerpt = (section.get("template_excerpt") or "").strip()
-    min_paragraphs = section.get("min_paragraphs") or 1
-    max_paragraphs = section.get("max_paragraphs") or 2
+    min_paragraphs = section.get("min_paragraphs")
+    max_paragraphs = section.get("max_paragraphs")
     max_chars = section.get("max_chars")
     outline_text = "\n".join(outline or [])
+
+    effective_sources = base_sources
+    if section_rag is not None:
+        section_query = " ".join(
+            part for part in [title, " ".join(str(g) for g in guidance)] if part
+        ).strip()
+        try:
+            extra = await section_rag(section_query)
+        except Exception as exc:
+            logger.warning("section RAG 검색 실패 (%s): %s", section_id, exc)
+            extra = []
+        if extra:
+            effective_sources = _merge_sources(base_sources, extra)
+            logger.info(
+                "[docx섹션RAG] %s (+%d 청크, 총 %d)",
+                section_id, len(extra), len(effective_sources),
+            )
+    sources_text = _format_sources_for_docx(effective_sources)
     data = await _chat_json(
         (
             "You are a report template filler. The user uploaded a docx report template and ran "
@@ -359,7 +400,13 @@ async def _build_section_output(
         (
             f"사용자 요청:\n{query}\n\n섹션 제목: {title}\noptional: {str(optional).lower()}\n\n"
             f"작성 지침: {(' / '.join(guidance)) if guidance else 'N/A'}\n"
-            f"길이 제한: {min_paragraphs}~{max_paragraphs}문단, {max_chars}자 이내\n\n"
+            + (
+                f"길이 제한: {min_paragraphs or '제한 없음'}~{max_paragraphs or '제한 없음'}문단"
+                + (f", {max_chars}자 이내" if max_chars else "")
+                + "\n\n"
+                if (min_paragraphs or max_paragraphs or max_chars)
+                else ""
+            ) +
             f"템플릿 섹션 예시(어투/형식 참고, 내용 복붙 금지):\n{template_excerpt or 'N/A'}\n\n"
             f"전체 개요(참고):\n{outline_text or 'N/A'}\n\n"
             "참고 소스는 source 구분(memento/web)이 포함되어 있습니다.\n"
@@ -382,7 +429,7 @@ async def _build_section_output(
     content = "\n\n".join(str(i).strip() for i in content_raw if str(i).strip()) if isinstance(content_raw, list) else str(content_raw or "").strip()
     if content:
         paragraphs = [p.strip() for p in re.split(r"\n{2,}", content) if p.strip()]
-        if max_paragraphs and len(paragraphs) > max_paragraphs:
+        if isinstance(max_paragraphs, int) and max_paragraphs > 0 and len(paragraphs) > max_paragraphs:
             paragraphs = paragraphs[:max_paragraphs]
         content = "\n\n".join(paragraphs)
     if not content and not optional:
@@ -392,8 +439,12 @@ async def _build_section_output(
 
 
 async def _build_table_output(
-    table: Dict[str, Any], query: str, sources_text: str, outline: Optional[List[str]] = None,
+    table: Dict[str, Any],
+    query: str,
+    base_sources: List[Dict[str, Any]],
+    outline: Optional[List[str]] = None,
     user_info: Optional[List[Dict[str, Any]]] = None,
+    section_rag=None,
 ) -> Tuple[str, Dict[str, Any]]:
     table_id = table.get("id") or ""
     headers = table.get("headers") or []
@@ -402,6 +453,25 @@ async def _build_table_output(
     header_is_data = bool(table.get("header_is_data"))
     section_title = table.get("section_title") or ""
     outline_text = "\n".join(outline or [])
+
+    effective_sources = base_sources
+    if section_rag is not None:
+        header_text = " ".join(str(h) for h in headers if h)
+        section_query = " ".join(
+            part for part in [section_title, header_text] if part
+        ).strip()
+        try:
+            extra = await section_rag(section_query) if section_query else []
+        except Exception as exc:
+            logger.warning("table RAG 검색 실패 (%s): %s", table_id, exc)
+            extra = []
+        if extra:
+            effective_sources = _merge_sources(base_sources, extra)
+            logger.info(
+                "[docx표RAG] %s (+%d 청크, 총 %d)",
+                table_id, len(extra), len(effective_sources),
+            )
+    sources_text = _format_sources_for_docx(effective_sources)
     table_type = table.get("table_type") or "mixed"
     key_value_no_header = bool(table.get("key_value_no_header"))
     if key_value_no_header:
@@ -483,22 +553,19 @@ async def _build_table_output(
                 rows[i] = (rows[i] + [""] * columns)[:columns]
             rows[i][0] = tmpl_row[0]
 
-    max_cell_chars = 120 if table_type == "meta" and columns <= 2 else (150 if table_type == "analytical" else 140)
-    trimmed_rows = []
+    normalized_rows = []
     for row in rows:
         if not isinstance(row, list):
             continue
         new_row = []
         for cell in row[:columns]:
             text = re.sub(r"<br\s*/?>", " ", str(cell or "").strip(), flags=re.IGNORECASE)
-            if len(text) > max_cell_chars:
-                text = text[:max_cell_chars].rstrip()
             new_row.append(text)
         while len(new_row) < columns:
             new_row.append("")
-        trimmed_rows.append(new_row)
+        normalized_rows.append(new_row)
 
-    data["rows"] = trimmed_rows
+    data["rows"] = normalized_rows
     return table_id, data
 
 
@@ -639,6 +706,9 @@ async def build_docx_output_from_schema(
     schema: Dict[str, Any],
     user_info: Optional[List[Dict[str, Any]]] = None,
     image_hints: Optional[List[Dict[str, Any]]] = None,
+    tenant_id: Optional[str] = None,
+    room_id: Optional[str] = None,
+    proc_inst_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """사전 분류(계획) → 노드별 병렬 fill → 결과 취합."""
     await asyncio.gather(
@@ -647,7 +717,6 @@ async def build_docx_output_from_schema(
         _apply_table_classification(schema.get("tables") or []),
     )
 
-    sources_text = _format_sources_for_docx(sources)
     sections = schema.get("sections") or []
     tables = schema.get("tables") or []
     sections_to_fill = [
@@ -659,16 +728,31 @@ async def build_docx_output_from_schema(
         len(sections_to_fill), len(sections), len(tables),
     )
 
+    section_rag = None
+    if (tenant_id or "").strip() and ((room_id or "").strip() or (proc_inst_id or "").strip()):
+        from ...memento import search_section_context
+
+        async def section_rag(section_query: str) -> List[Dict[str, Any]]:
+            return await search_section_context(
+                query=section_query,
+                tenant_id=tenant_id.strip(),
+                room_id=(room_id or "").strip() or None,
+                proc_inst_id=(proc_inst_id or "").strip() or None,
+                top_k=5,
+            )
+
     cover_output = await _build_cover_output(schema.get("cover") or {}, query, outline)
     semaphore = asyncio.Semaphore(6)
 
     async def _guarded_section(sec):
         async with semaphore:
-            return await _build_section_output(sec, query, sources_text, outline)
+            return await _build_section_output(sec, query, sources, outline, section_rag=section_rag)
 
     async def _guarded_table(tbl):
         async with semaphore:
-            return await _build_table_output(tbl, query, sources_text, outline, user_info=user_info)
+            return await _build_table_output(
+                tbl, query, sources, outline, user_info=user_info, section_rag=section_rag,
+            )
 
     section_results, table_results = await asyncio.gather(
         asyncio.gather(*[_guarded_section(s) for s in sections_to_fill]),
@@ -676,6 +760,7 @@ async def build_docx_output_from_schema(
     )
     sections_output = {sec_id: data for sec_id, data in section_results if sec_id}
     tables_output = {tbl_id: data for tbl_id, data in table_results if tbl_id}
+    sources_text = _format_sources_for_docx(sources)
     images = await _finalize_image_outputs(sections, sections_output, query, outline, sources_text, image_hints=image_hints)
     logger.info(
         "[docx병렬] fill 완료: 섹션 %d, 표 %d, 이미지 %d",

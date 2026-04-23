@@ -39,7 +39,7 @@ from ...io.file import extract_hwpx, find_section_files, repack_hwpx
 from .hwpx_to_html import hwpx_to_html
 
 
-logger = logging.getLogger("process-gpt-office-mcp")
+logger = logging.getLogger(__name__)
 
 
 def _merge_chunk_results(results: Iterable[dict]) -> list[dict]:

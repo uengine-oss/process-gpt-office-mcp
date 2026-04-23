@@ -12,7 +12,7 @@ from supabase import create_client
 from ...agent.agent import _call_llm_text
 from ...images import generate_image_gemini
 
-logger = logging.getLogger("office-mcp-slides")
+logger = logging.getLogger(__name__)
 
 STORAGE_BUCKET = "deep_research_files"
 

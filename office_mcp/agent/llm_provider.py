@@ -15,7 +15,7 @@ import re
 import time
 from abc import ABC, abstractmethod
 
-logger = logging.getLogger("process-gpt-office-mcp")
+logger = logging.getLogger(__name__)
 
 _MAX_RETRIES = 3
 

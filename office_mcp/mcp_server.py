@@ -49,27 +49,33 @@ class _SuppressLlmFilter(logging.Filter):
 
 
 def _setup_logging() -> logging.Logger:
+    """office_mcp 패키지 루트 로거에 핸들러를 부착한다.
+
+    각 모듈은 `logger = logging.getLogger(__name__)` 관용구를 쓰면 자식 로거가
+    자동으로 이 루트로 propagate되어 파일/스트림에 기록된다. 이름 하드코드가
+    필요 없고, 한 곳에서만 핸들러를 관리한다.
+    """
     log_path = Path(LOG_PATH)
     if log_path.exists():
         log_path.unlink()
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    logger = logging.getLogger("process-gpt-office-mcp")
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-    logger.propagate = False
+    pkg_logger = logging.getLogger("office_mcp")
+    pkg_logger.setLevel(logging.INFO)
+    pkg_logger.handlers.clear()
+    pkg_logger.propagate = False  # 서드파티 로그(httpx 등)와 격리
 
     fmt = logging.Formatter(
-        "%(asctime)s %(levelname)s process-gpt-office-mcp - %(message)s"
+        "%(asctime)s %(levelname)s %(name)s - %(message)s"
     )
     file_handler = logging.FileHandler(log_path, encoding="utf-8")
     file_handler.setFormatter(fmt)
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(fmt)
     stream_handler.addFilter(_SuppressLlmFilter())
-    logger.addHandler(file_handler)
-    logger.addHandler(stream_handler)
-    return logger
+    pkg_logger.addHandler(file_handler)
+    pkg_logger.addHandler(stream_handler)
+    return logging.getLogger(__name__)
 
 
 logger = _setup_logging()
@@ -770,6 +776,9 @@ async def generate_docx(
             schema=schema,
             user_info=user_info or None,
             image_hints=image_hints or None,
+            tenant_id=(tenant_id or "").strip() or None,
+            room_id=(room_id or "").strip() or None,
+            proc_inst_id=(proc_inst_id or "").strip() or None,
         )
 
         apply_schema_output(doc, schema, schema_output, report_id=rid)

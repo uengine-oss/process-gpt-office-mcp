@@ -9,7 +9,7 @@ from .parser import collect_runs_and_texts
 from .xml_utils import find_parent, tag, ns, register_namespaces
 
 
-logger = logging.getLogger("process-gpt-office-mcp")
+logger = logging.getLogger(__name__)
 
 # ── 각주 마커: [FN:본문텍스트|각주설명] ──
 _FOOTNOTE_RE = re.compile(r"\[FN:([^|]+)\|([^\]]+)\]")

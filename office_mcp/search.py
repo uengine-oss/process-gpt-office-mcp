@@ -6,7 +6,7 @@ from typing import Any, Dict, List
 
 import requests
 
-logger = logging.getLogger("process-gpt-office-mcp")
+logger = logging.getLogger(__name__)
 
 
 def search_tavily(query: str, max_results: int = 5) -> List[Dict[str, Any]]:

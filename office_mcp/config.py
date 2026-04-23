@@ -143,7 +143,7 @@ def _mask_secret(value: str) -> str:
 def log_config_summary() -> None:
     """서버 시작 시 주요 설정값을 로그로 출력한다."""
     import logging
-    logger = logging.getLogger("process-gpt-office-mcp")
+    logger = logging.getLogger(__name__)
     lines = [
         "",
         "============================================================",

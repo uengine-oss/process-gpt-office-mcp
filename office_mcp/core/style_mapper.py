@@ -7,7 +7,7 @@ from xml.etree import ElementTree as ET
 from .xml_utils import tag, register_namespaces, find_parent
 
 
-logger = logging.getLogger("process-gpt-office-mcp")
+logger = logging.getLogger(__name__)
 
 
 def _bgr_to_rgb(color: str | None) -> str | None:
