@@ -58,10 +58,13 @@ def _docs_to_sources(raw_docs: List[Any]) -> List[Dict[str, Any]]:
                 "source": "memento",
                 "_chunk_index": metadata.get("chunk_index"),
                 "_file_name": file_name,
+                "_file_id": metadata.get("file_id") or "",
                 "_drive_folder_name": folder_name,
                 "_section_title": metadata.get("section_title") or "",
                 # PDF: 1-based page_number (없으면 page+1로 보강됨). 다른 포맷은 None.
                 "_page_number": metadata.get("page_number"),
+                # PDF 청크의 bbox 유니온(JSON 문자열). 값 예: '[{"page":11,"bbox":[50,100,550,200]}]'.
+                "_bboxes_json": metadata.get("bboxes_json") or "",
             }
         )
     return sources
@@ -265,9 +268,11 @@ async def _retrieve_by_indices(
                     "source": "memento",
                     "_chunk_index": metadata.get("chunk_index"),
                     "_file_name": src_file,
+                    "_file_id": metadata.get("file_id") or "",
                     "_drive_folder_name": folder_name,
                     "_section_title": metadata.get("section_title") or "",
                     "_page_number": metadata.get("page_number"),
+                    "_bboxes_json": metadata.get("bboxes_json") or "",
                 }
             )
         return sources
@@ -744,6 +749,9 @@ def sources_to_numbered_reference_text(
             "chunk_index": src.get("chunk_index") or src.get("_chunk_index"),
             "page": src.get("page_number") or src.get("_page_number"),
             "url": src.get("url") or "",
+            # PDF 하이라이트 프리뷰용 원본 식별자.
+            "file_id": src.get("file_id") or src.get("_file_id") or "",
+            "bboxes_json": src.get("bboxes_json") or src.get("_bboxes_json") or "",
         })
         parts.append(f"[출처#{n}: {title}]\n{content}")
         n += 1

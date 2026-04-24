@@ -69,6 +69,8 @@ def _format_sources_for_docx(
             "page": item.get("page_number") or item.get("_page_number"),
             "url": url,
             "source_type": source_type,
+            "file_id": item.get("file_id") or item.get("_file_id") or "",
+            "bboxes_json": item.get("bboxes_json") or item.get("_bboxes_json") or "",
         })
         meta_lines = [f"source: {source_type}"]
         if url:
@@ -506,6 +508,8 @@ def _resolve_source_refs(
             "chunk_index": m.get("chunk_index"),
             "page": m.get("page"),
             "url": m.get("url", ""),
+            "file_id": m.get("file_id", ""),
+            "bboxes_json": m.get("bboxes_json", ""),
         })
     return out
 

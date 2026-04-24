@@ -940,6 +940,9 @@ async def process_hwpx_file(
                             "section_title": meta.get("section_title", ""),
                             "snippet": meta.get("snippet", ""),
                             "url": meta.get("url", ""),
+                            # PDF 하이라이트 프리뷰용 (vue3가 /preview/pdf-highlight 호출)
+                            "file_id": meta.get("file_id", ""),
+                            "bboxes_json": meta.get("bboxes_json", ""),
                         })
                         total_refs += 1
                     if resolved:
