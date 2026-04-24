@@ -417,14 +417,42 @@ _ANALYZE_RULES_PROJECT_STATUS = """## 분류 카테고리
 출력: {"id":3,"category":"label","action":"keep","skip_fill":true,"reason":"섹션 제목"}"""
 
 _ANALYZE_RULES_GENERIC = """## 분류 카테고리
-- label: 라벨/제목. 수정 불가.
+- label: 라벨/제목/여백. 수정 불가.
 - fill: 내용을 채울 빈 필드.
 - placeholder: 교체 대상 (가이드 텍스트, [대괄호] 등).
 
 ## 규칙
 - 볼드 제목 → category:"label", action:"keep", skip_fill:true
 - [대괄호] 텍스트 → category:"placeholder", action:"replace", skip_fill:false
-- 빈 필드 → category:"fill", action:"write", skip_fill:false"""
+- 빈 필드 → category:"fill", action:"write", skip_fill:false
+- 큰 제목(폰트≥14pt) 위·아래에 붙어있는 연속된 빈 문단은 **레이아웃 여백(spacer)** → category:"label", action:"keep", skip_fill:true
+- 제목 문단 자체가 비어있어도(사용자가 채울 표지 제목칸) 주변 여백 문단과 구분할 것: 여백은 절대 본문으로 채우지 말 것"""
+
+
+# 제목페이지(1페이지/표지) 전용 추가 지침 — chunk_idx == 0 일 때 주입
+_ANALYZE_TITLE_PAGE_HINT = """
+## ★ 제목페이지(표지) 특별 지침 — 이 청크가 문서 첫 페이지일 가능성이 높음
+한국 보고서의 1페이지는 대개 **표지(cover/title page)** 구조입니다. 다음을 반드시 지키세요:
+
+1. **표지 레이아웃 요소** (일반적인 표지 구성):
+   - 최상단·중앙의 큰 제목 (폰트 크게, 굵게, 가운데 정렬)
+   - 부제/설명 (제목 바로 아래)
+   - 하단의 작성자·기관·날짜 정보
+   - 위 요소들 **사이를 벌리기 위한 다수의 빈 문단** (레이아웃용 여백)
+
+2. **여백 문단 처리 — 가장 중요**:
+   - 제목·부제·작성자 정보 **사이 또는 위아래에 연속으로 붙어있는 빈 문단**은 시각적 간격을 위한 **spacer**임.
+   - 이 spacer 문단에는 **절대로 본문 내용을 채우지 말 것** → category:"label", action:"keep", skip_fill:true
+   - 폰트가 8pt든 10pt든 12pt든, 용도가 spacer이면 skip_fill:true
+   - 판단 근거: 빈 문단이 2개 이상 연속되거나, 큰 폰트의 제목/중앙정렬 요소 주변에 있다면 spacer로 간주.
+
+3. **표지에서 실제로 채워야 할 곳**:
+   - 제목 칸(큰 폰트의 빈 문단 단 1개) → fill
+   - 부제/설명 칸 (제목 바로 아래 1~2개) → fill
+   - 작성자·날짜 등 메타정보 칸 → fill 또는 placeholder
+
+4. **의심스러우면 skip_fill:true로 처리**. 표지에 본문을 쏟아붓는 것보다 비워두는 편이 훨씬 낫습니다.
+"""
 
 
 async def agent_analyze_chunk(
@@ -478,6 +506,9 @@ async def agent_analyze_chunk(
     else:
         category_and_examples = _ANALYZE_RULES_GENERIC
 
+    # 첫 청크(표지 가능성)에만 제목페이지 전용 지침 주입
+    title_page_section = _ANALYZE_TITLE_PAGE_HINT if chunk_idx == 0 else ""
+
     # 프로젝트 정보
     project_section = f"## 프로젝트 정보\n{report_description}\n\n" if report_description else ""
 
@@ -485,6 +516,7 @@ async def agent_analyze_chunk(
 {doc_view}
 {table_summary_section}{context_section}
 {category_and_examples}
+{title_page_section}
 
 ## 출력(JSON만, 설명 없이)
 {{"tables_to_remove":[],"nodes":[{{"id":1,"category":"fill","action":"write","skip_fill":false,"reason":"..."}}]}}

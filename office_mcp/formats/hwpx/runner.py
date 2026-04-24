@@ -747,6 +747,13 @@ async def process_hwpx_file(
                         nid = item.get("id")
                         if nid is None:
                             continue
+                        if isinstance(nid, str) and nid.isdigit():
+                            nid = int(nid)
+                        elif isinstance(nid, float):
+                            nid = int(nid)
+                        elif not isinstance(nid, int):
+                            continue
+                        item["id"] = nid
                         category_map[nid] = (
                             (item.get("category") or "").strip(),
                             bool(item.get("skip_fill", False)),
