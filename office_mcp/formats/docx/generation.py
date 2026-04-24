@@ -859,6 +859,28 @@ async def build_docx_output_from_schema(
         len(sections_output), len(tables_output), len(images),
         total_sec_sources, total_tbl_sources,
     )
+
+    # PDF 하이라이트 preview URL 사전 렌더링
+    if (tenant_id or "").strip():
+        try:
+            from ...memento import prefetch_preview_urls_for_sources
+            all_srcs_flat = []
+            for lst in section_sources_meta.values():
+                all_srcs_flat.extend(lst)
+            for lst in table_sources_meta.values():
+                all_srcs_flat.extend(lst)
+            if all_srcs_flat:
+                await prefetch_preview_urls_for_sources(
+                    tenant_id.strip(), all_srcs_flat, dpi=120,
+                )
+                with_url = sum(1 for s in all_srcs_flat if s.get("preview_url"))
+                logger.info(
+                    "[docx출처프리뷰] preview URL 사전 렌더링 %d/%d 성공",
+                    with_url, len(all_srcs_flat),
+                )
+        except Exception as exc:
+            logger.warning("[docx출처프리뷰] 실패(계속 진행): %s", exc)
+
     return {
         "sections": sections_output,
         "tables": tables_output,

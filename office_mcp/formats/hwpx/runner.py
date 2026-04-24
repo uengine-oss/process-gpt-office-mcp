@@ -21,6 +21,7 @@ from ...memento import (
     search_memento_images_multi_query,
     sources_to_reference_text,
     sources_to_numbered_reference_text,
+    prefetch_preview_urls_for_sources,
 )
 from ...config import (
     DEBUG_OUTPUT_DIR,
@@ -952,6 +953,23 @@ async def process_hwpx_file(
                     "[출처수집] 전체 fill=%d → 출처 달린 노드=%d (총 참조=%d)",
                     len(all_fills), len(node_sources_map), total_refs,
                 )
+
+                # PDF 하이라이트 preview URL 사전 렌더링 — memento 호출로 Supabase에 미리 캐시해두고
+                # URL만 메타에 박아놓는다. 프론트는 런타임 fetch 없이 <img src=preview_url>로 끝.
+                try:
+                    all_srcs_flat = [s for lst in node_sources_map.values() for s in lst]
+                    if all_srcs_flat and (tenant_id or "").strip():
+                        t_pre = time.perf_counter()
+                        await prefetch_preview_urls_for_sources(
+                            tenant_id.strip(), all_srcs_flat, dpi=120,
+                        )
+                        with_url = sum(1 for s in all_srcs_flat if s.get("preview_url"))
+                        logger.info(
+                            "[출처프리뷰] preview URL 사전 렌더링 %d/%d 성공 (%.1fs)",
+                            with_url, len(all_srcs_flat), time.perf_counter() - t_pre,
+                        )
+                except Exception as exc:
+                    logger.warning("[출처프리뷰] 실패(계속 진행): %s", exc)
 
                 # 사이드카 JSON 저장 — <output>.sources.json
                 try:

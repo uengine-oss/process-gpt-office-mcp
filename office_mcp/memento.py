@@ -717,6 +717,107 @@ def sources_to_reference_text(sources: List[Dict[str, Any]]) -> str:
     return "\n\n---\n\n".join(parts)
 
 
+async def prefetch_pdf_highlight_url(
+    tenant_id: str,
+    file_id: str,
+    page: int,
+    bbox: List[float],
+    dpi: int = 120,
+) -> Optional[str]:
+    """memento `/preview/pdf-highlight`를 호출해 하이라이트 PNG의 public URL을 받아온다.
+
+    실패 시 None. 문서 생성 시점에 미리 렌더링 + Supabase 업로드까지 끝내두고
+    HTML의 data-sources에 URL을 직접 박아 넣기 위한 헬퍼.
+    """
+    if not tenant_id or not file_id or page is None or not bbox or len(bbox) != 4:
+        return None
+    url = f"{_get_memento_url()}/preview/pdf-highlight"
+    params: Dict[str, Any] = {
+        "tenant_id": tenant_id,
+        "file_id": file_id,
+        "page": int(page),
+        "bbox": ",".join(f"{float(v):.2f}" for v in bbox),
+        "dpi": dpi,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=90) as client:
+            resp = await client.get(url, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+            result = (data.get("url") or "").strip()
+            return result or None
+    except Exception as exc:
+        logger.warning("prefetch_pdf_highlight 실패 (file=%s p=%s): %s", file_id, page, exc)
+        return None
+
+
+async def prefetch_preview_urls_for_sources(
+    tenant_id: str, sources_meta_list: List[Dict[str, Any]], dpi: int = 120,
+) -> None:
+    """여러 소스 메타에 대해 preview_url을 병렬 fetch해서 각 메타 dict에 in-place 주입.
+
+    source meta 형태(hwpx-mcp 내부):
+        {file_id: str, bboxes_json: str, ...}
+    성공 시 `preview_url` 키가 dict에 추가된다. 실패는 조용히 스킵.
+    같은 (file_id, page, bbox) 조합은 재사용(중복 호출 방지).
+    """
+    if not tenant_id or not sources_meta_list:
+        return
+    import json as _json_mod
+
+    # 중복 제거: 같은 (file_id, page, bbox) → 한 번만 호출
+    dedup_tasks: Dict[tuple, asyncio.Task] = {}
+    # 각 src와 그에 필요한 key 매핑
+    src_keys: List[tuple] = []  # list of (src_dict, key_tuple_or_None)
+
+    for src in sources_meta_list:
+        file_id = src.get("file_id") or ""
+        bboxes_raw = src.get("bboxes_json") or ""
+        if not file_id or not bboxes_raw:
+            src_keys.append((src, None))
+            continue
+        try:
+            bboxes = _json_mod.loads(bboxes_raw)
+        except Exception:
+            src_keys.append((src, None))
+            continue
+        if not isinstance(bboxes, list) or not bboxes:
+            src_keys.append((src, None))
+            continue
+        first = bboxes[0]
+        bbox = first.get("bbox")
+        page = first.get("page")
+        if not isinstance(bbox, list) or len(bbox) != 4 or page is None:
+            src_keys.append((src, None))
+            continue
+        key = (file_id, int(page), tuple(round(float(v), 2) for v in bbox))
+        src_keys.append((src, key))
+        if key not in dedup_tasks:
+            dedup_tasks[key] = asyncio.create_task(
+                prefetch_pdf_highlight_url(tenant_id, file_id, page, bbox, dpi=dpi)
+            )
+
+    if not dedup_tasks:
+        return
+
+    # 모든 태스크 완료 대기
+    await asyncio.gather(*dedup_tasks.values(), return_exceptions=True)
+
+    # 각 src에 결과 주입
+    for src, key in src_keys:
+        if not key:
+            continue
+        task = dedup_tasks.get(key)
+        if task is None or not task.done():
+            continue
+        try:
+            url = task.result()
+        except Exception:
+            url = None
+        if url:
+            src["preview_url"] = url
+
+
 def sources_to_numbered_reference_text(
     sources: List[Dict[str, Any]], start_idx: int = 0
 ) -> tuple[str, List[Dict[str, Any]]]:
