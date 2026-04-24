@@ -16,7 +16,12 @@ from ...agent.agent import (
     agent_select_reference_images,
     agent_select_source_chunks,
 )
-from ...memento import search_memento_multi_query, search_memento_images_multi_query, sources_to_reference_text
+from ...memento import (
+    search_memento_multi_query,
+    search_memento_images_multi_query,
+    sources_to_reference_text,
+    sources_to_numbered_reference_text,
+)
 from ...config import (
     DEBUG_OUTPUT_DIR,
     DEBUG_OUTPUT_ENABLED,
@@ -353,6 +358,7 @@ async def process_hwpx_file(
     image_reference_enabled: bool | None = None,
     source_chunks: list[dict] | None = None,
     proc_inst_id: str | None = None,
+    room_id: str | None = None,
 ) -> str:
     if not report_topic:
         raise ValueError("report_topic is required")
@@ -462,6 +468,9 @@ async def process_hwpx_file(
             # 이미지 참조 중복 방지: 이미 선택된 image_id를 청크 간 공유
             used_image_ids: set[str] = set()
             _used_image_lock = asyncio.Lock()
+            # 청크별 출처 메타 리스트: chunk_idx → [{file_name, title, snippet, _full_text, ...}]
+            # source_refs의 N 번호 → 이 리스트의 인덱스로 역매핑.
+            chunks_sources_meta: dict[int, list[dict]] = {}
 
             async def _process_chunk(chunk: list, chunk_idx: int = 0,
                                      prev_chunk: list | None = None,
@@ -500,13 +509,18 @@ async def process_hwpx_file(
 
                 # ── RAG 쿼리 생성 + 이미지 판단을 병렬 실행 ──
                 chunk_reference = reference_text
+                # 이 청크 전용 출처 메타 리스트(번호 순서). RAG/source_chunks 양쪽이 append.
+                chunk_sources_meta: list[dict] = []
                 chunk_ref_images: list[dict] = []
                 _img_ref_cfg = image_reference_enabled if image_reference_enabled is not None else IMAGE_REFERENCE_ENABLED
                 image_ref_enabled = _img_ref_cfg and bool((tenant_id or "").strip())
                 has_tenant = bool((tenant_id or "").strip())
 
                 async def _do_rag() -> str:
-                    """RAG 쿼리 생성 → memento 검색 → reference_text 반환."""
+                    """RAG 쿼리 생성 → memento 검색 → 번호부여된 reference_text 반환.
+
+                    부수효과: chunk_sources_meta 에 출처 메타를 append.
+                    """
                     if not has_tenant:
                         return reference_text
                     try:
@@ -522,11 +536,20 @@ async def process_hwpx_file(
                                 rag_queries, tenant_id.strip(), top_k=5,
                                 file_names=selected_file_names,
                                 proc_inst_id=(proc_inst_id or "").strip() or None,
+                                room_id=(room_id or "").strip() or None,
                             )
                             if rag_sources:
-                                rag_text = sources_to_reference_text(rag_sources)
+                                rag_text, meta = sources_to_numbered_reference_text(
+                                    rag_sources, start_idx=len(chunk_sources_meta)
+                                )
+                                chunk_sources_meta.extend(meta)
                                 result = rag_text + "\n\n---\n\n" + reference_text if reference_text else rag_text
-                                logger.info("[청크RAG] 참고자료 %d개 추가 (%.1f KB)", len(rag_sources), len(rag_text) / 1024)
+                                logger.info(
+                                    "[청크RAG] 참고자료 %d개 추가 (%.1f KB, 번호 #%d~#%d)",
+                                    len(meta), len(rag_text) / 1024,
+                                    len(chunk_sources_meta) - len(meta),
+                                    len(chunk_sources_meta) - 1,
+                                )
                                 return result
                     except Exception as exc:
                         logger.warning("[청크RAG] 실패 (기존 reference_text 사용): %s", exc)
@@ -682,20 +705,20 @@ async def process_hwpx_file(
                                 report_description=report_description,
                             )
                         if selected_indices:
-                            source_texts = []
-                            for idx in selected_indices:
-                                sc = source_chunks[idx]
-                                fn = sc.get("file_name", "")
-                                orig = sc.get("original_text", "")
-                                source_texts.append(f"[출처: {fn}]\n{orig}")
-                            source_reference = "\n\n---\n\n".join(source_texts)
+                            selected_list = [source_chunks[i] for i in selected_indices]
+                            source_reference, sc_meta = sources_to_numbered_reference_text(
+                                selected_list, start_idx=len(chunk_sources_meta)
+                            )
+                            chunk_sources_meta.extend(sc_meta)
                             if chunk_reference:
                                 chunk_reference = source_reference + "\n\n---\n\n" + chunk_reference
                             else:
                                 chunk_reference = source_reference
                             logger.info(
-                                "[소스참고] 청크 %d: 소스 청크 %d개 선택 → reference_text에 추가 (%.1f KB)",
-                                chunk_idx, len(selected_indices), len(source_reference) / 1024,
+                                "[소스참고] 청크 %d: 소스 청크 %d개 선택 → reference_text에 추가 (%.1f KB, 번호 #%d~#%d)",
+                                chunk_idx, len(sc_meta), len(source_reference) / 1024,
+                                len(chunk_sources_meta) - len(sc_meta),
+                                len(chunk_sources_meta) - 1,
                             )
                         else:
                             logger.info("[소스참고] 청크 %d: 관련 소스 청크 없음", chunk_idx)
@@ -777,6 +800,9 @@ async def process_hwpx_file(
                 # 참조 이미지 정보를 filled에 포함
                 if isinstance(filled, dict):
                     filled["_reference_images"] = chunk_ref_images
+                # 이 청크의 출처 메타 리스트를 공유 dict에 저장 (fill 수집 단계에서 역매핑)
+                if chunk_sources_meta:
+                    chunks_sources_meta[chunk_idx] = chunk_sources_meta
                 return filled
 
             logger.info("[청크처리] asyncio.gather 시작: %d개 청크", len(chunks))
@@ -790,7 +816,7 @@ async def process_hwpx_file(
             ])
             all_raw = []
             all_node_ids = {n.id for n in nodes if n.id is not None}
-            for chunk_fills, chunk_nodes_list in zip(results, chunks):
+            for chunk_idx_i, (chunk_fills, chunk_nodes_list) in enumerate(zip(results, chunks)):
                 fills_list = chunk_fills.get("fills") if isinstance(chunk_fills, dict) else []
                 if not fills_list:
                     continue
@@ -813,6 +839,8 @@ async def process_hwpx_file(
                     logger.warning("[fill id보정] 0-based 순번 → data-id로 매핑")
                 for f in fills_list:
                     if isinstance(f, dict) and isinstance(f.get("id"), int) and "new_text" in f:
+                        # 출처 역매핑을 위해 청크 인덱스 태깅 (all_fills 진입 후에도 유지)
+                        f["_chunk_idx"] = chunk_idx_i
                         all_raw.append(f)
             # 참조 이미지 수집
             all_reference_images: list[dict] = []
@@ -873,6 +901,65 @@ async def process_hwpx_file(
                 all_fills.append(f)
             logger.info("[fill필터] all_raw=%d → all_fills=%d (통과 ID: %s)",
                         len(all_raw), len(all_fills), [f["id"] for f in all_fills])
+
+            # ── source_refs 수집 → node_sources_map ──
+            # LLM이 emit한 source_refs(chunk-local N)를 해당 청크의 meta 리스트와 매핑.
+            # 과거에는 4-gram 자카드 overlap으로 약한 매칭을 제거했으나, LLM이 안 붙이면
+            # 빈 배열이 오고 붙인 것은 근거가 있다는 전제로 신뢰한다.
+            node_sources_map: dict[int, list[dict]] = {}
+            if chunks_sources_meta:
+                total_refs = 0
+                for f in all_fills:
+                    raw_refs = f.get("source_refs") or []
+                    if not isinstance(raw_refs, list) or not raw_refs:
+                        continue
+                    ci = f.get("_chunk_idx")
+                    meta_list = chunks_sources_meta.get(ci) if ci is not None else None
+                    if not meta_list:
+                        continue
+                    nid = f["id"]
+                    resolved: list[dict] = []
+                    seen_keys: set = set()
+                    for ref in raw_refs:
+                        try:
+                            ref_idx = int(ref)
+                        except (TypeError, ValueError):
+                            continue
+                        if ref_idx < 0 or ref_idx >= len(meta_list):
+                            continue
+                        meta = meta_list[ref_idx]
+                        key = (meta.get("file_name", ""), meta.get("chunk_index"))
+                        if key in seen_keys:
+                            continue  # 같은 청크 중복 참조 제거
+                        seen_keys.add(key)
+                        resolved.append({
+                            "file_name": meta.get("file_name", ""),
+                            "title": meta.get("title", ""),
+                            "chunk_index": meta.get("chunk_index"),
+                            "page": meta.get("page"),
+                            "section_title": meta.get("section_title", ""),
+                            "snippet": meta.get("snippet", ""),
+                            "url": meta.get("url", ""),
+                        })
+                        total_refs += 1
+                    if resolved:
+                        existing = node_sources_map.get(nid) or []
+                        node_sources_map[nid] = existing + resolved
+                logger.info(
+                    "[출처수집] 전체 fill=%d → 출처 달린 노드=%d (총 참조=%d)",
+                    len(all_fills), len(node_sources_map), total_refs,
+                )
+
+                # 사이드카 JSON 저장 — <output>.sources.json
+                try:
+                    import json as _json_mod
+                    sidecar_path = Path(output_path).with_suffix(Path(output_path).suffix + ".sources.json")
+                    sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(sidecar_path, "w", encoding="utf-8") as fp:
+                        _json_mod.dump(node_sources_map, fp, ensure_ascii=False, indent=2)
+                    logger.info("[출처수집] 사이드카 저장 → %s", sidecar_path)
+                except Exception as exc:
+                    logger.warning("[출처수집] 사이드카 저장 실패: %s", exc)
 
             image_insert_enabled = image_generation_enabled if image_generation_enabled is not None else IMAGE_GENERATION_ENABLED
             node_by_id = {n.id: n for n in nodes if n.id is not None}
@@ -1047,7 +1134,10 @@ async def process_hwpx_file(
         # HTML 변환본 생성
         result_html = result_dir / (Path(output_path).stem + ".html")
         try:
-            hwpx_to_html(Path(output_path), result_html, use_lineseg=False, inject_ids=True)
+            hwpx_to_html(
+                Path(output_path), result_html, use_lineseg=False, inject_ids=True,
+                sources_map=node_sources_map or None,
+            )
             logger.info("[디버그] 완성본 저장 → %s (hwpx + html)", result_dir)
         except Exception as exc:
             logger.warning("[디버그] 완성본 HTML 변환 실패: %s", exc)

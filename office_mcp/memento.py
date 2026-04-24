@@ -26,8 +26,10 @@ def _get_memento_url() -> str:
 
 
 def _get_drive_folder_param() -> Dict[str, str]:
-    from .config import MEMENTO_DRIVE_FOLDER_ID
-    return {"drive_folder_id": MEMENTO_DRIVE_FOLDER_ID} if MEMENTO_DRIVE_FOLDER_ID else {}
+    """Deprecated — drive_folder_id 기반 필터는 더 이상 사용하지 않는다.
+    현재는 room_id 또는 proc_inst_id 로만 필터링한다. 빈 dict 반환.
+    """
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +60,8 @@ def _docs_to_sources(raw_docs: List[Any]) -> List[Dict[str, Any]]:
                 "_file_name": file_name,
                 "_drive_folder_name": folder_name,
                 "_section_title": metadata.get("section_title") or "",
+                # PDF: 1-based page_number (없으면 page+1로 보강됨). 다른 포맷은 None.
+                "_page_number": metadata.get("page_number"),
             }
         )
     return sources
@@ -72,15 +76,17 @@ async def _broad_search(
     tenant_id: str,
     top_k: int = 15,
     proc_inst_id: Optional[str] = None,
+    room_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     url = f"{_get_memento_url()}/retrieve"
     base_params: Dict[str, Any] = {
         "query": query,
         "tenant_id": tenant_id,
-        **_get_drive_folder_param(),
     }
-    # proc_inst_id 필터가 있으면 전체 검색 대신 해당 프로세스 인스턴스로 범위 제한
-    if proc_inst_id:
+    # 우선순위: room_id > proc_inst_id > all_docs (폴백).
+    if room_id:
+        base_params["room_id"] = room_id
+    elif proc_inst_id:
         base_params["proc_inst_id"] = proc_inst_id
     else:
         base_params["all_docs"] = "true"
@@ -186,9 +192,15 @@ async def _list_documents_with_folders(tenant_id: str) -> List[Dict[str, str]]:
         return []
 
 
-async def _get_chunks_metadata(tenant_id: str, file_name: str) -> List[Dict[str, Any]]:
+async def _get_chunks_metadata(
+    tenant_id: str, file_name: str, room_id: Optional[str] = None, proc_inst_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     url = f"{_get_memento_url()}/documents/chunks-metadata"
-    params = {"tenant_id": tenant_id, "file_name": file_name, **_get_drive_folder_param()}
+    params: Dict[str, Any] = {"tenant_id": tenant_id, "file_name": file_name}
+    if room_id:
+        params["room_id"] = room_id
+    elif proc_inst_id:
+        params["proc_inst_id"] = proc_inst_id
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.get(url, params=params)
@@ -207,17 +219,21 @@ async def _get_chunks_metadata(tenant_id: str, file_name: str) -> List[Dict[str,
 
 
 async def _retrieve_by_indices(
-    tenant_id: str, file_name: str, chunk_indices: List[int]
+    tenant_id: str, file_name: str, chunk_indices: List[int],
+    room_id: Optional[str] = None, proc_inst_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     if not chunk_indices:
         return []
     url = f"{_get_memento_url()}/retrieve-by-indices"
-    payload = {
+    payload: Dict[str, Any] = {
         "tenant_id": tenant_id,
         "file_name": file_name,
         "chunk_indices": chunk_indices,
-        **_get_drive_folder_param(),
     }
+    if room_id:
+        payload["room_id"] = room_id
+    elif proc_inst_id:
+        payload["proc_inst_id"] = proc_inst_id
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(url, json=payload)
@@ -251,6 +267,7 @@ async def _retrieve_by_indices(
                     "_file_name": src_file,
                     "_drive_folder_name": folder_name,
                     "_section_title": metadata.get("section_title") or "",
+                    "_page_number": metadata.get("page_number"),
                 }
             )
         return sources
@@ -606,18 +623,21 @@ async def search_memento_by_documents(
     outline: List[str],
     tenant_id: str,
     file_names: List[str],
+    room_id: Optional[str] = None,
+    proc_inst_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """사용자가 선택한 특정 문서들만 대상으로 스마트 검색을 수행한다.
 
     search_memento_smart와 동일한 로직이지만 Step 1~2(문서 목록 조회+LLM 선택)를
     건너뛰고, 사용자가 직접 선택한 file_names로 바로 청크 검색을 수행한다.
+    room_id 또는 proc_inst_id 로 범위를 제한한다 (chunks-metadata / retrieve-by-indices 둘 다).
     """
     if not tenant_id or not file_names:
         return []
 
     logger.info(
-        "search_memento_by_documents 시작 (query=%s, tenant_id=%s, files=%s)",
-        query, tenant_id, file_names,
+        "search_memento_by_documents 시작 (query=%s, tenant_id=%s, files=%s, room_id=%s, proc_inst_id=%s)",
+        query, tenant_id, file_names, room_id, proc_inst_id,
     )
 
     max_total_chunks = 30
@@ -626,7 +646,9 @@ async def search_memento_by_documents(
     for file_name in file_names:
         if len(precise_sources) >= max_total_chunks:
             break
-        chunks_metadata = await _get_chunks_metadata(tenant_id, file_name)
+        chunks_metadata = await _get_chunks_metadata(
+            tenant_id, file_name, room_id=room_id, proc_inst_id=proc_inst_id,
+        )
         if not chunks_metadata:
             logger.info("chunks-metadata 없음 (%s) → 건너뜀", file_name)
             continue
@@ -643,7 +665,10 @@ async def search_memento_by_documents(
 
         logger.info("LLM 선택 chunk_indices (%s): %s", file_name, selected_indices)
 
-        doc_sources = await _retrieve_by_indices(tenant_id, file_name, selected_indices)
+        doc_sources = await _retrieve_by_indices(
+            tenant_id, file_name, selected_indices,
+            room_id=room_id, proc_inst_id=proc_inst_id,
+        )
         if doc_sources:
             precise_sources.extend(doc_sources)
 
@@ -685,6 +710,44 @@ def sources_to_reference_text(sources: List[Dict[str, Any]]) -> str:
             continue
         parts.append(f"[{title}]\n{content}")
     return "\n\n---\n\n".join(parts)
+
+
+def sources_to_numbered_reference_text(
+    sources: List[Dict[str, Any]], start_idx: int = 0
+) -> tuple[str, List[Dict[str, Any]]]:
+    """번호를 부여한 reference_text + 출처 메타 리스트를 반환.
+
+    LLM이 fill 결과에 `source_refs: [N, ...]`로 인용할 수 있도록
+    `[출처#N: title]\\n원문` 포맷으로 변환한다.
+    메타 리스트는 N 순서로 정렬되어 반환되며, 각 항목은
+    {file_name, title, snippet, section_title, chunk_index, url} 형태.
+    """
+    if not sources:
+        return "", []
+    parts: List[str] = []
+    meta: List[Dict[str, Any]] = []
+    n = start_idx
+    for src in sources:
+        content = (src.get("content") or src.get("original_text") or "").strip()
+        if not content:
+            continue
+        title = src.get("title") or src.get("file_name") or "Untitled"
+        file_name = src.get("file_name") or src.get("_file_name") or title
+        snippet = content.replace("\n", " ")
+        if len(snippet) > 240:
+            snippet = snippet[:240] + "…"
+        meta.append({
+            "file_name": file_name,
+            "title": title,
+            "snippet": snippet,
+            "section_title": src.get("section_title") or src.get("_section_title") or "",
+            "chunk_index": src.get("chunk_index") or src.get("_chunk_index"),
+            "page": src.get("page_number") or src.get("_page_number"),
+            "url": src.get("url") or "",
+        })
+        parts.append(f"[출처#{n}: {title}]\n{content}")
+        n += 1
+    return "\n\n---\n\n".join(parts), meta
 
 
 async def search_memento_images(
@@ -763,12 +826,13 @@ async def search_memento_multi_query(
     top_k: int = 5,
     file_names: List[str] | None = None,
     proc_inst_id: Optional[str] = None,
+    room_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """여러 쿼리로 memento를 검색하고 중복 제거해 반환한다.
 
     각 쿼리별 top_k개를 가져온 뒤 content 기준으로 중복을 제거한다.
     file_names가 주어지면 해당 문서에서 나온 결과만 반환한다.
-    proc_inst_id가 주어지면 해당 프로세스 인스턴스 문서만 대상으로 검색한다.
+    room_id 또는 proc_inst_id 로 검색 범위를 제한한다.
     """
     if not tenant_id or not queries:
         return []
@@ -776,12 +840,17 @@ async def search_memento_multi_query(
     filter_desc = ""
     if file_names:
         filter_desc += f", 문서필터={len(file_names)}개"
-    if proc_inst_id:
+    if room_id:
+        filter_desc += f", room_id={room_id}"
+    elif proc_inst_id:
         filter_desc += f", proc_inst_id={proc_inst_id}"
     logger.info("[청크RAG] %d개 쿼리로 memento 검색 시작 (top_k=%d%s)", len(queries), top_k, filter_desc)
 
     # 모든 쿼리를 병렬로 검색
-    tasks = [_broad_search(q, tenant_id, top_k=top_k, proc_inst_id=proc_inst_id) for q in queries]
+    tasks = [
+        _broad_search(q, tenant_id, top_k=top_k, proc_inst_id=proc_inst_id, room_id=room_id)
+        for q in queries
+    ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     # 파일명 필터 준비 (부분 매칭: 선택 문서명이 결과 파일명에 포함되면 통과)

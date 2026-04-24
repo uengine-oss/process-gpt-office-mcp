@@ -1,10 +1,25 @@
 import argparse
 import base64
 import html
+import json
 import re
 import zipfile
 from pathlib import Path
 import xml.etree.ElementTree as ET
+
+
+def _build_id_attrs(data_id, sources_map):
+    """data-id + data-sources 속성 문자열 생성. 둘 다 없으면 빈 문자열."""
+    if data_id is None:
+        return ""
+    attr = f" data-id=\"{data_id}\""
+    if sources_map:
+        srcs = sources_map.get(data_id) or sources_map.get(str(data_id))
+        if srcs:
+            # JSON을 HTML 속성값에 넣기 위해 따옴표 이스케이프
+            encoded = html.escape(json.dumps(srcs, ensure_ascii=False), quote=True)
+            attr += f" data-sources=\"{encoded}\""
+    return attr
 
 from ...core.parser import collect_runs_and_texts
 from ...core.xml_utils import tag as core_tag
@@ -321,7 +336,7 @@ def _extract_box_style(para_style: dict) -> dict:
 
 
 def _render_lineseg_paragraph(
-    paragraph, char_styles, para_styles, border_fills, styles, node_id_map=None
+    paragraph, char_styles, para_styles, border_fills, styles, node_id_map=None, sources_map=None
 ):
     blocks = []
     style_id = paragraph.attrib.get("styleIDRef")
@@ -402,7 +417,7 @@ def _render_lineseg_paragraph(
         data_id = None
         if node_id_map:
             data_id = node_id_map.get("p", {}).get(paragraph)
-        data_attr = f" data-id=\"{data_id}\"" if data_id is not None else ""
+        data_attr = _build_id_attrs(data_id, sources_map)
         blocks.append(
             f"<div class=\"line\"{data_attr} style=\"{line_style_str}\">"
             + "".join(span_chunks)
@@ -444,6 +459,7 @@ def _render_runs(
     in_table=False,
     node_id_map=None,
     img_map=None,
+    sources_map=None,
 ):
     blocks = []
     current_segments = []
@@ -470,7 +486,7 @@ def _render_runs(
 
     if use_lineseg and not paragraph.findall(".//hp:tbl", NS):
         line_blocks = _render_lineseg_paragraph(
-            paragraph, char_styles, para_styles, border_fills, styles, node_id_map=node_id_map
+            paragraph, char_styles, para_styles, border_fills, styles, node_id_map=node_id_map, sources_map=sources_map
         )
         if line_blocks:
             return line_blocks
@@ -482,7 +498,7 @@ def _render_runs(
             data_id = None
             if node_id_map:
                 data_id = node_id_map.get("p", {}).get(paragraph)
-            data_attr = f" data-id=\"{data_id}\"" if data_id is not None else ""
+            data_attr = _build_id_attrs(data_id, sources_map)
             blocks.append(f"<p{data_attr} style=\"{para_style_str}\">{span_html}</p>")
             current_segments = []
 
@@ -500,6 +516,7 @@ def _render_runs(
                     styles,
                     node_id_map=node_id_map,
                     img_map=img_map,
+                    sources_map=sources_map,
                 )
             )
             continue
@@ -561,7 +578,7 @@ def _render_runs(
             data_id = None
             if node_id_map:
                 data_id = node_id_map.get("p", {}).get(paragraph)
-            data_attr = f" data-id=\"{data_id}\"" if data_id is not None else ""
+            data_attr = _build_id_attrs(data_id, sources_map)
             blocks.append(
                 f"<p{data_attr} style=\"{para_style_str}\"><span style=\"{run_style}\">&nbsp;</span></p>"
             )
@@ -569,7 +586,7 @@ def _render_runs(
             data_id = None
             if node_id_map:
                 data_id = node_id_map.get("p", {}).get(paragraph)
-            data_attr = f" data-id=\"{data_id}\"" if data_id is not None else ""
+            data_attr = _build_id_attrs(data_id, sources_map)
             blocks.append(f"<p{data_attr} style=\"{para_style_str}\">&nbsp;</p>")
     elif current_segments:
         flush_paragraph()
@@ -659,7 +676,7 @@ def _table_max_bottom(tbl):
     return max_bottom
 
 
-def _render_table(tbl, char_styles, para_styles, border_fills, styles, rows=None, node_id_map=None, img_map=None):
+def _render_table(tbl, char_styles, para_styles, border_fills, styles, rows=None, node_id_map=None, img_map=None, sources_map=None):
     tbl_style = {}
     sz = tbl.find("hp:sz", NS)
     if sz is not None:
@@ -778,7 +795,7 @@ def _render_table(tbl, char_styles, para_styles, border_fills, styles, rows=None
             data_id = None
             if node_id_map:
                 data_id = node_id_map.get("tc", {}).get(tc)
-            data_attr = f" data-id=\"{data_id}\"" if data_id is not None else ""
+            data_attr = _build_id_attrs(data_id, sources_map)
             cells_html.append(
                 f"<td{data_attr} style=\"{_build_style(cell_style)}\"{span_attrs}>{cell_content}</td>"
             )
@@ -884,6 +901,7 @@ def _render_children(
     in_table=False,
     node_id_map=None,
     img_map=None,
+    sources_map=None,
 ):
     blocks = []
     for idx, child in enumerate(children):
@@ -961,11 +979,12 @@ def _render_children(
                     in_table=in_table,
                     node_id_map=node_id_map,
                     img_map=img_map,
+                    sources_map=sources_map,
                 )
             )
         elif tag == "tbl":
             blocks.append(
-                _render_table(child, char_styles, para_styles, border_fills, styles, node_id_map=node_id_map, img_map=img_map)
+                _render_table(child, char_styles, para_styles, border_fills, styles, node_id_map=node_id_map, img_map=img_map, sources_map=sources_map)
             )
     return blocks
 
@@ -980,6 +999,7 @@ def _render_block_list(
     in_table=False,
     node_id_map=None,
     img_map=None,
+    sources_map=None,
 ):
     return _render_children(
         list(parent),
@@ -991,6 +1011,7 @@ def _render_block_list(
         in_table=in_table,
         node_id_map=node_id_map,
         img_map=img_map,
+        sources_map=sources_map,
     )
 
 
@@ -1071,7 +1092,7 @@ def _section_page_style(section_root):
     return style
 
 
-def hwpx_to_html(hwpx_path: Path, output_path: Path, use_lineseg: bool, inject_ids: bool = False, split_pages: bool = True):
+def hwpx_to_html(hwpx_path: Path, output_path: Path, use_lineseg: bool, inject_ids: bool = False, split_pages: bool = True, sources_map: dict | None = None):
     with zipfile.ZipFile(hwpx_path) as zipf:
         char_styles, para_styles, border_fills, styles = _parse_header(zipf)
         section_names = _sorted_section_names(zipf)
@@ -1123,7 +1144,7 @@ def hwpx_to_html(hwpx_path: Path, output_path: Path, use_lineseg: bool, inject_i
                         pchildren, char_styles, para_styles,
                         border_fills, styles,
                         use_lineseg=use_lineseg, node_id_map=node_id_map,
-                        img_map=img_map,
+                        img_map=img_map, sources_map=sources_map,
                     )
                     body_blocks.append(
                         f"<div class=\"page\" style=\"{_build_style(page_style)}\">"
@@ -1215,6 +1236,7 @@ def hwpx_to_html(hwpx_path: Path, output_path: Path, use_lineseg: bool, inject_i
                                     use_lineseg=use_lineseg,
                                     node_id_map=node_id_map,
                                     img_map=img_map,
+                                    sources_map=sources_map,
                                 )
                                 body_blocks.append(
                                     f"<div class=\"page\" style=\"{_build_style(page_style)}\">"
@@ -1260,6 +1282,7 @@ def hwpx_to_html(hwpx_path: Path, output_path: Path, use_lineseg: bool, inject_i
                                     rows=rows,
                                     node_id_map=node_id_map,
                                     img_map=img_map,
+                                    sources_map=sources_map,
                                 )
                                 body_blocks.append(
                                     f"<div class=\"page\" style=\"{_build_style(page_style)}\">"
@@ -1285,6 +1308,7 @@ def hwpx_to_html(hwpx_path: Path, output_path: Path, use_lineseg: bool, inject_i
                                 use_lineseg=use_lineseg,
                                 node_id_map=node_id_map,
                                 img_map=img_map,
+                                sources_map=sources_map,
                             )
                             body_blocks.append(
                                 f"<div class=\"page\" style=\"{_build_style(page_style)}\">"
@@ -1308,6 +1332,7 @@ def hwpx_to_html(hwpx_path: Path, output_path: Path, use_lineseg: bool, inject_i
                                 use_lineseg=use_lineseg,
                                 node_id_map=node_id_map,
                                 img_map=img_map,
+                                sources_map=sources_map,
                             )
                             body_blocks.append(
                                 f"<div class=\"page\" style=\"{_build_style(page_style)}\">"
@@ -1326,6 +1351,7 @@ def hwpx_to_html(hwpx_path: Path, output_path: Path, use_lineseg: bool, inject_i
                                 use_lineseg=use_lineseg,
                                 node_id_map=node_id_map,
                                 img_map=img_map,
+                                sources_map=sources_map,
                             )
                             body_blocks.append(
                                 f"<div class=\"page\" style=\"{_build_style(page_style)}\">"
@@ -1349,6 +1375,7 @@ def hwpx_to_html(hwpx_path: Path, output_path: Path, use_lineseg: bool, inject_i
                         use_lineseg=use_lineseg,
                         node_id_map=node_id_map,
                         img_map=img_map,
+                        sources_map=sources_map,
                     )
                     body_blocks.append(
                         f"<div class=\"page\" style=\"{_build_style(page_style)}\">"

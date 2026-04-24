@@ -35,22 +35,46 @@ def _merge_sources(primary: List[Dict[str, Any]], extra: List[Dict[str, Any]]) -
     return merged
 
 
-def _format_sources_for_docx(sources: List[Dict[str, Any]], limit: int = 100) -> str:
+def _format_sources_for_docx(
+    sources: List[Dict[str, Any]], limit: int = 100
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """참고 소스를 번호부여된 텍스트로 변환 + 번호→메타 리스트 반환.
+
+    LLM이 `source_refs: [N]` 로 인용할 수 있도록 `[출처#N: title]` 포맷으로 구성한다.
+    반환되는 meta 리스트는 N 순서로 정렬되며 {file_name, title, snippet,
+    section_title, chunk_index, url, source_type} 형태.
+    """
     if not sources:
-        return ""
+        return "", []
     memento = [s for s in sources if s.get("source") == "memento"]
     others = [s for s in sources if s.get("source") != "memento"]
-    blocks = []
-    for item in (memento + others)[:limit]:
-        title = item.get("title") or "Untitled"
+    ordered = (memento + others)[:limit]
+    blocks: List[str] = []
+    meta: List[Dict[str, Any]] = []
+    for n, item in enumerate(ordered):
+        title = item.get("title") or item.get("file_name") or "Untitled"
         url = item.get("url") or ""
         content = (item.get("content") or "").strip()
         source_type = item.get("source") or "unknown"
+        file_name = item.get("file_name") or item.get("_file_name") or title
+        snippet = content.replace("\n", " ")
+        if len(snippet) > 240:
+            snippet = snippet[:240] + "…"
+        meta.append({
+            "file_name": file_name,
+            "title": title,
+            "snippet": snippet,
+            "section_title": item.get("section_title") or item.get("_section_title") or "",
+            "chunk_index": item.get("chunk_index") or item.get("_chunk_index"),
+            "page": item.get("page_number") or item.get("_page_number"),
+            "url": url,
+            "source_type": source_type,
+        })
         meta_lines = [f"source: {source_type}"]
         if url:
             meta_lines.append(f"url: {url}")
-        blocks.append(f"[{title}]\n{chr(10).join(meta_lines)}\n{content}")
-    return "\n\n".join(blocks)
+        blocks.append(f"[출처#{n}: {title}]\n{chr(10).join(meta_lines)}\n{content}")
+    return "\n\n".join(blocks), meta
 
 
 def _format_table_template(headers: List, row_samples: List) -> str:
@@ -162,8 +186,13 @@ _SCHEMA_SECTION_FILL = {
         "properties": {
             "status": {"type": "string", "enum": ["fill", "partial", "omit"]},
             "content": {"type": "string"},
+            "source_refs": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": "참고 소스에서 [출처#N]으로 표시된 N 번호. 실제 근거로 삼은 것만 기재. 상상/일반상식은 제외.",
+            },
         },
-        "required": ["status", "content"],
+        "required": ["status", "content", "source_refs"],
     },
 }
 
@@ -178,8 +207,13 @@ _SCHEMA_TABLE_FILL = {
                 "type": "array",
                 "items": {"type": "array", "items": {"type": "string"}},
             },
+            "source_refs": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": "참고 소스에서 [출처#N]으로 표시된 N 번호. 실제 근거로 삼은 것만 기재.",
+            },
         },
-        "required": ["status", "rows"],
+        "required": ["status", "rows", "source_refs"],
     },
 }
 
@@ -390,7 +424,7 @@ async def _build_section_output(
                 "[docx섹션RAG] %s (+%d 청크, 총 %d)",
                 section_id, len(extra), len(effective_sources),
             )
-    sources_text = _format_sources_for_docx(effective_sources)
+    sources_text, sources_meta = _format_sources_for_docx(effective_sources)
     data = await _chat_json(
         (
             "You are a report template filler. The user uploaded a docx report template and ran "
@@ -409,12 +443,13 @@ async def _build_section_output(
             ) +
             f"템플릿 섹션 예시(어투/형식 참고, 내용 복붙 금지):\n{template_excerpt or 'N/A'}\n\n"
             f"전체 개요(참고):\n{outline_text or 'N/A'}\n\n"
-            "참고 소스는 source 구분(memento/web)이 포함되어 있습니다.\n"
+            "참고 소스는 source 구분(memento/web)이 포함되어 있으며, 각 블록 앞에 [출처#N: title] 번호가 붙어있습니다.\n"
             "memento(내부 문서) 소스를 우선 참고하고, 웹 소스는 보조로만 사용하세요.\n\n"
             f"참고 소스:\n{sources_text or 'N/A'}\n\n"
             "이 섹션에 들어갈 내용을 작성하세요.\n"
-            "- JSON만 출력\n- keys: status, content\n"
+            "- JSON만 출력\n- keys: status, content, source_refs\n"
             "- status는 fill | partial | omit 중 하나\n- optional=true 섹션은 자료 부족 시 omit\n"
+            "- source_refs: 실제 근거로 삼은 [출처#N]의 N 번호만 기재. 상상·일반상식으로 쓴 경우 빈 배열.\n"
         ),
         context=f"section:{section_id}:{title}",
         schema=_SCHEMA_SECTION_FILL,
@@ -435,7 +470,44 @@ async def _build_section_output(
     if not content and not optional:
         content = "자료가 제한적이어서 간략 요약만 제공합니다."
     data["content"] = content
+    # source_refs → 실제 출처 메타 리스트로 변환
+    data["_sources"] = _resolve_source_refs(data.get("source_refs"), sources_meta)
     return section_id, data
+
+
+def _resolve_source_refs(
+    source_refs: Any, sources_meta: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """LLM이 돌려준 source_refs(int 배열)를 sources_meta에서 찾아 메타 리스트로 변환.
+
+    중복 청크(file_name + chunk_index)는 1회만 포함. 잘못된 인덱스는 무시.
+    """
+    if not isinstance(source_refs, list) or not sources_meta:
+        return []
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    for ref in source_refs:
+        try:
+            idx = int(ref)
+        except (TypeError, ValueError):
+            continue
+        if idx < 0 or idx >= len(sources_meta):
+            continue
+        m = sources_meta[idx]
+        key = (m.get("file_name") or "", m.get("chunk_index"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "file_name": m.get("file_name", ""),
+            "title": m.get("title", ""),
+            "snippet": m.get("snippet", ""),
+            "section_title": m.get("section_title", ""),
+            "chunk_index": m.get("chunk_index"),
+            "page": m.get("page"),
+            "url": m.get("url", ""),
+        })
+    return out
 
 
 async def _build_table_output(
@@ -471,7 +543,7 @@ async def _build_table_output(
                 "[docx표RAG] %s (+%d 청크, 총 %d)",
                 table_id, len(extra), len(effective_sources),
             )
-    sources_text = _format_sources_for_docx(effective_sources)
+    sources_text, sources_meta = _format_sources_for_docx(effective_sources)
     table_type = table.get("table_type") or "mixed"
     key_value_no_header = bool(table.get("key_value_no_header"))
     if key_value_no_header:
@@ -524,11 +596,13 @@ async def _build_table_output(
             f"표 양식(템플릿):\n{table_template_text}\n\n"
             f"{row_guidance}"
             f"전체 개요(참고):\n{outline_text or 'N/A'}\n\n"
+            "참고 소스는 각 블록 앞에 [출처#N: title] 번호가 붙어있습니다.\n"
             "memento(내부 문서) 소스를 우선 참고하고, 웹 소스는 보조로만 사용하세요.\n\n"
             f"참고 소스:\n{sources_text or 'N/A'}\n\n"
             "위 양식을 연구 결과로 채우세요.\n"
-            "- JSON만 출력\n- keys: status, rows\n"
+            "- JSON만 출력\n- keys: status, rows, source_refs\n"
             "- status는 fill | partial | omit 중 하나\n- rows는 2차원 배열\n"
+            "- source_refs: 실제 근거로 삼은 [출처#N]의 N 번호만 기재. 없으면 빈 배열.\n"
         ),
         context=f"table:{table_id}:{section_title}",
         schema=_SCHEMA_TABLE_FILL,
@@ -566,6 +640,7 @@ async def _build_table_output(
         normalized_rows.append(new_row)
 
     data["rows"] = normalized_rows
+    data["_sources"] = _resolve_source_refs(data.get("source_refs"), sources_meta)
     return table_id, data
 
 
@@ -760,10 +835,31 @@ async def build_docx_output_from_schema(
     )
     sections_output = {sec_id: data for sec_id, data in section_results if sec_id}
     tables_output = {tbl_id: data for tbl_id, data in table_results if tbl_id}
-    sources_text = _format_sources_for_docx(sources)
+    sources_text, _ = _format_sources_for_docx(sources)
     images = await _finalize_image_outputs(sections, sections_output, query, outline, sources_text, image_hints=image_hints)
+    # 출처 메타 요약 — section_id / table_id 별 [{file_name, snippet, ...}] 매핑
+    section_sources_meta = {
+        sid: (data.get("_sources") or [])
+        for sid, data in sections_output.items()
+        if isinstance(data, dict) and data.get("_sources")
+    }
+    table_sources_meta = {
+        tid: (data.get("_sources") or [])
+        for tid, data in tables_output.items()
+        if isinstance(data, dict) and data.get("_sources")
+    }
+    total_sec_sources = sum(len(v) for v in section_sources_meta.values())
+    total_tbl_sources = sum(len(v) for v in table_sources_meta.values())
     logger.info(
-        "[docx병렬] fill 완료: 섹션 %d, 표 %d, 이미지 %d",
+        "[docx병렬] fill 완료: 섹션 %d, 표 %d, 이미지 %d / 출처 — 섹션=%d건, 표=%d건",
         len(sections_output), len(tables_output), len(images),
+        total_sec_sources, total_tbl_sources,
     )
-    return {"sections": sections_output, "tables": tables_output, "images": images, "cover": cover_output}
+    return {
+        "sections": sections_output,
+        "tables": tables_output,
+        "images": images,
+        "cover": cover_output,
+        "section_sources": section_sources_meta,
+        "table_sources": table_sources_meta,
+    }

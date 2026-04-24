@@ -1,4 +1,5 @@
 """DOCX template parsing, schema extraction, content application, and Supabase upload."""
+import json
 import logging
 import os
 import re
@@ -110,6 +111,30 @@ def _set_paragraph_text(para, text: str) -> None:
             run.text = ""
     else:
         para.add_run(text)
+
+
+def _tag_sources_on_para(para, sources: Optional[List[Dict[str, Any]]]) -> None:
+    """파라그래프 CT_P 요소에 data-sources 속성을 JSON으로 박는다.
+
+    docx_to_html가 렌더링 시 이 속성을 읽어 HTML 데이터 속성으로 전달한다.
+    Word 자체는 미지 속성을 무시하므로 안전.
+    """
+    if not sources:
+        return
+    try:
+        para._p.set("data-sources", json.dumps(sources, ensure_ascii=False))
+    except Exception as exc:
+        logger.warning("data-sources 태깅 실패 (paragraph): %s", exc)
+
+
+def _tag_sources_on_cell(cell, sources: Optional[List[Dict[str, Any]]]) -> None:
+    """표 셀의 첫 파라그래프에 data-sources를 박는다."""
+    if not sources:
+        return
+    paragraphs = list(getattr(cell, "paragraphs", []) or [])
+    if not paragraphs:
+        return
+    _tag_sources_on_para(paragraphs[0], sources)
 
 
 def _insert_paragraph_after(paragraph, text: str = ""):
@@ -358,6 +383,10 @@ def apply_schema_output(
             heading_index = sec.get("heading_index")
             if new_title and isinstance(heading_index, int) and heading_index < len(doc.paragraphs):
                 _set_paragraph_text(doc.paragraphs[heading_index], str(new_title))
+        # section_sources: section_id → [meta]. generation output의 section_sources 키에서 옴.
+        section_sources_map = output.get("section_sources") if isinstance(output, dict) else None
+        if not isinstance(section_sources_map, dict):
+            section_sources_map = {}
         for sec_id, content in sections_output.items():
             sec = section_index.get(sec_id)
             if not sec:
@@ -374,16 +403,24 @@ def apply_schema_output(
             if not text:
                 continue
             indices = sec.get("paragraph_indices") or []
+            target_para = None
             if indices:
-                _set_paragraph_text(doc.paragraphs[indices[0]], text)
+                target_para = doc.paragraphs[indices[0]]
+                _set_paragraph_text(target_para, text)
                 # 형제 placeholder는 건드리지 않는다 — LLM이 섹션 1개로 처리한 경우
                 # 나머지 placeholder는 원본 안내문 그대로 남겨 사용자가 편집할 수 있게 한다.
             else:
-                doc.add_paragraph(text)
+                target_para = doc.add_paragraph(text)
+            # 출처 메타 태깅 (있을 때만)
+            _tag_sources_on_para(target_para, section_sources_map.get(sec_id))
 
     tables_output = output.get("tables") if isinstance(output, dict) else None
     if isinstance(tables_output, dict):
         table_index = {t.get("id"): t for t in schema.get("tables", [])}
+        # table_sources: table_id → [meta].
+        table_sources_map = output.get("table_sources") if isinstance(output, dict) else None
+        if not isinstance(table_sources_map, dict):
+            table_sources_map = {}
         for tbl_id, tbl_content in tables_output.items():
             tbl_meta = table_index.get(tbl_id)
             if not tbl_meta:
@@ -392,6 +429,10 @@ def apply_schema_output(
             if idx is None or idx >= len(doc.tables):
                 continue
             table = doc.tables[idx]
+            tbl_sources = table_sources_map.get(tbl_id)
+            # 표의 첫 셀에 출처 태깅 (tooltip이 여기 달림)
+            if tbl_sources and table.rows and table.rows[0].cells:
+                _tag_sources_on_cell(table.rows[0].cells[0], tbl_sources)
             header_is_data = bool(tbl_meta.get("header_is_data"))
             status = None
             rows = []

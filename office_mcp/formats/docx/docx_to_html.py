@@ -599,6 +599,12 @@ def _render_paragraph(paragraph, doc_defaults_rpr, doc_defaults_ppr, styles_map,
 
     content = "".join(run_htmls) if run_htmls else "&nbsp;"
     id_attr = f' data-id="{counter.next()}"' if counter is not None else ""
+    # 템플릿 치환 단계에서 <w:p>에 박아놓은 data-sources 속성을 그대로 emit.
+    # apply_schema_output가 set("data-sources", json)으로 태깅. 없으면 빈 문자열.
+    sources_raw = paragraph.attrib.get("data-sources")
+    if sources_raw:
+        from html import escape as _html_escape
+        id_attr += f' data-sources="{_html_escape(sources_raw, quote=True)}"'
     return f'<p{id_attr} style="{_build_style(final_ppr)}">{content}</p>'
 
 

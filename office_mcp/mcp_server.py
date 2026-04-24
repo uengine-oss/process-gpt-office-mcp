@@ -417,6 +417,8 @@ async def generate_hwpx(
                     outline=[report_description] if report_description else [report_topic],
                     tenant_id=tenant_id.strip(),
                     file_names=selected_docs,
+                    room_id=(room_id or "").strip() or None,
+                    proc_inst_id=(proc_inst_id or "").strip() or None,
                 )
                 logger.info("generate_hwpx: 선택 문서 기반 검색 완료 (%d개 소스)", len(memento_sources))
             else:
@@ -482,15 +484,27 @@ async def generate_hwpx(
             image_reference_enabled=image_reference_enabled,
             source_chunks=source_chunks or None,
             proc_inst_id=(proc_inst_id or "").strip() or None,
+            room_id=(room_id or "").strip() or None,
         )
 
         if DEBUG_OUTPUT_ENABLED:
             DEBUG_OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(output_path, DEBUG_OUTPUT_PATH / output_name)
         file_url = _upload_hwpx_to_storage(output_path, output_name)
+        # 출처 사이드카 (runner가 저장함) 로드 — 없어도 무해
+        _sources_map = None
+        try:
+            import json as _json_sc
+            _sidecar = Path(str(output_path) + ".sources.json")
+            if _sidecar.exists():
+                with open(_sidecar, "r", encoding="utf-8") as _fp:
+                    _sources_map = _json_sc.load(_fp)
+                logger.info("출처 사이드카 로드: %d개 노드", len(_sources_map or {}))
+        except Exception as _e:
+            logger.warning("출처 사이드카 로드 실패: %s", _e)
         html_url = ""
         try:
-            hwpx_to_html(output_path, html_output_path, use_lineseg=False, inject_ids=True)
+            hwpx_to_html(output_path, html_output_path, use_lineseg=False, inject_ids=True, sources_map=_sources_map)
             html_url = _upload_html_to_storage(html_output_path, output_html_name)
         except Exception as e:
             logger.warning("HTML 변환 실패 (HWPX만 반환): %s", e)

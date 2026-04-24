@@ -645,6 +645,18 @@ async def agent_fill_chunk(
     if IMAGE_GENERATION_ENABLED:
         image_rule = "\n이미지가 효과적인 곳에 [IMAGE:설명] 마커 삽입. 작은 표 셀에는 넣지 마세요."
 
+    # 출처 emit 규칙 — 참고 텍스트에 [출처#N: ...] 블록이 있을 때만 활성화
+    source_rule = ""
+    example_fill = '{"id":307,"new_text":"..."}'
+    if reference_text and "[출처#" in reference_text:
+        source_rule = (
+            "\n출처: 위 '참고 텍스트'에서 실제로 근거로 삼은 내용이 있으면, "
+            "해당 fill 항목에 `source_refs` 배열로 [출처#N]의 N 번호를 기재. "
+            "참고하지 않은 항목에는 source_refs를 넣지 말 것(빈 배열도 생략). "
+            "상상·일반상식으로 쓴 문장에는 절대 source_refs를 붙이지 말 것."
+        )
+        example_fill = '{"id":307,"new_text":"...","source_refs":[0,3]}'
+
     prompt_user = f"""## 보고서 주제
 {report_topic}
 {domain_section}{ref_section}
@@ -657,10 +669,10 @@ async def agent_fill_chunk(
 ## 작업
 action=write/replace이고 skip_fill=false인 노드만 작성. id는 data-id 값 그대로 사용.
 표 셀은 data-size에 맞게 분량 조절.
-{footnote_rule}{image_rule}
+{footnote_rule}{image_rule}{source_rule}
 
 ## 출력(JSON만, 설명 없이)
-{{"fills":[{{"id":307,"new_text":"..."}}]}}
+{{"fills":[{example_fill}]}}
 """
     return await asyncio.to_thread(
         _call_llm_json, prompt_sys, prompt_user, 0.3
