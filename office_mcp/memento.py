@@ -1,6 +1,6 @@
 """Memento RAG 모듈 — process-gpt-memento 서비스에서 내부 지식 자료를 검색한다.
 
-deep-research-custom의 memento.py를 hwpx-mcp 내부에서 독립적으로 사용할 수 있도록 포팅.
+deep-research-custom의 memento.py를 process-gpt-office-mcp 내부에서 독립적으로 사용할 수 있도록 포팅.
 tenant_id만 있으면 memento에서 RAG 소스를 가져올 수 있다.
 """
 
@@ -80,23 +80,29 @@ async def _broad_search(
     top_k: int = 15,
     proc_inst_id: Optional[str] = None,
     room_id: Optional[str] = None,
+    file_ids: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     url = f"{_get_memento_url()}/retrieve"
-    base_params: Dict[str, Any] = {
-        "query": query,
-        "tenant_id": tenant_id,
-    }
-    # 우선순위: room_id > proc_inst_id > all_docs (폴백).
-    if room_id:
-        base_params["room_id"] = room_id
+    base_params: List[tuple] = [
+        ("query", query),
+        ("tenant_id", tenant_id),
+    ]
+    # 우선순위: file_ids > room_id > proc_inst_id > all_docs (폴백).
+    # file_ids 가 있으면 사용자가 명시 선택한 자료에만 검색을 제한한다.
+    if file_ids:
+        for fid in file_ids:
+            if fid:
+                base_params.append(("file_ids", str(fid)))
+    elif room_id:
+        base_params.append(("room_id", room_id))
     elif proc_inst_id:
-        base_params["proc_inst_id"] = proc_inst_id
+        base_params.append(("proc_inst_id", proc_inst_id))
     else:
-        base_params["all_docs"] = "true"
+        base_params.append(("all_docs", "true"))
     async with _MEMENTO_SEM:
         async with httpx.AsyncClient(timeout=60) as client:
             try:
-                response = await client.get(url, params={**base_params, "top_k": top_k})
+                response = await client.get(url, params=[*base_params, ("top_k", top_k)])
                 if response.status_code == 422:
                     logger.warning("memento가 top_k 파라미터를 지원하지 않음 → top_k 없이 재시도")
                     response = await client.get(url, params=base_params)
@@ -113,16 +119,31 @@ async def _process_search(
     tenant_id: str,
     proc_inst_id: str,
     top_k: int = 15,
+    file_ids: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
-    """프로세스 인스턴스(proc_inst_id)에 ingest된 문서만 대상으로 단순 retrieve."""
-    return await _broad_search(query, tenant_id, top_k=top_k, proc_inst_id=proc_inst_id)
+    """프로세스 인스턴스(proc_inst_id)에 ingest된 문서만 대상으로 단순 retrieve.
+
+    ``file_ids`` 가 같이 주어지면 그 자료들에만 추가로 제한된다.
+    """
+    return await _broad_search(
+        query, tenant_id, top_k=top_k, proc_inst_id=proc_inst_id, file_ids=file_ids,
+    )
 
 
-async def _room_search(query: str, tenant_id: str, room_id: str, top_k: int = 15) -> List[Dict[str, Any]]:
+async def _room_search(
+    query: str,
+    tenant_id: str,
+    room_id: str,
+    top_k: int = 15,
+    file_ids: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
     """채팅방(room_id)에 업로드된 문서만 대상으로 memento /retrieve 호출.
 
-    드라이브 폴더 필터는 쓰지 않는다 — 방에 올린 파일만 대상으로 한다.
+    ``file_ids`` 가 같이 주어지면 *사용자가 명시 선택한* 자료에 한정 검색한다
+    (file_ids 가 있으면 room_id 보다 우선 — _broad_search 와 동일 정책).
     """
+    if file_ids:
+        return await _broad_search(query, tenant_id, top_k=top_k, file_ids=file_ids)
     url = f"{_get_memento_url()}/retrieve"
     async with _MEMENTO_SEM:
         async with httpx.AsyncClient(timeout=60) as client:
@@ -494,13 +515,15 @@ async def search_memento_smart(
     tenant_id: str,
     room_id: Optional[str] = None,
     proc_inst_id: Optional[str] = None,
+    file_ids: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """문서-우선 스마트 Memento 검색.
 
     우선순위:
-      1. room_id 있음 → 채팅방 업로드 문서만 단순 /retrieve
-      2. proc_inst_id 있음 → 해당 프로세스 인스턴스 문서만 단순 /retrieve
-      3. 그 외 → 드라이브 기반 스마트 플로우(Step 1~6, 현재 비활성화 상태)
+      1. file_ids 있음 → 사용자가 명시 선택한 자료에만 검색 (가장 우선)
+      2. room_id 있음 → 채팅방 업로드 문서만 단순 /retrieve
+      3. proc_inst_id 있음 → 해당 프로세스 인스턴스 문서만 단순 /retrieve
+      4. 그 외 → 드라이브 기반 스마트 플로우(Step 1~6, 현재 비활성화 상태)
 
     드라이브 기반 스마트 플로우는 LLM 3단계 선택(문서 → 청크 index → 내용 검수)을
     수행하지만 비용이 크고 proc_inst_id 범위 필터가 보편화된 이후 기본 경로에서는
@@ -509,6 +532,24 @@ async def search_memento_smart(
     """
     if not tenant_id:
         return []
+
+    # 명시 선택 자료 시나리오: file_ids 가 주어지면 그 자료에만 검색을 제한.
+    # room_id / proc_inst_id 보다 우선 — 사용자 의도가 가장 좁은 필터이기 때문.
+    if file_ids:
+        logger.info(
+            "search_memento_smart(file_ids) 시작 (query=%s, tenant_id=%s, file_ids=%d개)",
+            query, tenant_id, len(file_ids),
+        )
+        file_sources = await _broad_search(
+            query, tenant_id, top_k=15, file_ids=file_ids,
+        )
+        for s in file_sources:
+            s.pop("_chunk_index", None)
+            s.pop("_file_name", None)
+            s.pop("_drive_folder_name", None)
+            s.pop("_section_title", None)
+        logger.info("search_memento_smart(file_ids) 완료: %d 청크", len(file_sources))
+        return file_sources
 
     # 채팅방 시나리오: room에 올린 문서만 참조 → 드라이브 선택 단계 스킵
     if room_id:
@@ -756,7 +797,7 @@ async def prefetch_preview_urls_for_sources(
 ) -> None:
     """여러 소스 메타에 대해 preview_url을 병렬 fetch해서 각 메타 dict에 in-place 주입.
 
-    source meta 형태(hwpx-mcp 내부):
+    source meta 형태(process-gpt-office-mcp 내부):
         {file_id: str, bboxes_json: str, ...}
     성공 시 `preview_url` 키가 dict에 추가된다. 실패는 조용히 스킵.
     같은 (file_id, page, bbox) 조합은 재사용(중복 호출 방지).

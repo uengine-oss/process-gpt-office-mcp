@@ -1,5 +1,5 @@
 """
-hwpx-mcp 서버 설정.
+process-gpt-office-mcp 서버 설정.
 
 설계 원칙:
   - .env: 키, 프로바이더 선택, URL (민감 정보 / 배포 환경별 엔드포인트)
@@ -79,7 +79,8 @@ else:
 OPENAI_MODEL_NAME: str = "gpt-5.1"
 OPENROUTER_MODEL_NAME: str = "openai/gpt-oss-120b"
 GEMINI_MODEL_NAME: str = "gemini-3.1-flash-image-preview"
-LLM_CUSTOM_MODEL_NAME: str = "/models/openai/gpt-oss-120b"
+# LLM_CUSTOM_MODEL_NAME: str = "/models/openai/gpt-oss-120b"
+LLM_CUSTOM_MODEL_NAME: str = "frentis-ai-model"
 
 _MODEL_MAP = {
     "openai": OPENAI_MODEL_NAME,
@@ -95,10 +96,13 @@ REASONING_EFFORT: str | None = "low"  # "low" | "medium" | "high" | None
 
 # 기능 On/Off
 LLM_VISION_ENABLED: bool = False
-WEB_SEARCH_ENABLED: bool = False
+WEB_SEARCH_ENABLED: bool = True
 IMAGE_GENERATION_ENABLED: bool = False
 IMAGE_REFERENCE_ENABLED: bool = False
 VISION_CHUNK_PLAN_ENABLED: bool = False
+# 본문 채우기 전에 문서 전체를 한 번 훑어 일관된 스토리라인(outline)을 만들고
+# 모든 청크가 그 outline을 컨텍스트로 받도록 한다 — 청크 간 어조·고유명사·메시지 정합성 향상.
+REPORT_OUTLINE_ENABLED: bool = True
 
 # 이미지 생성 (Gemini)
 GEMINI_IMAGE_MODEL: str = "gemini-3.1-flash-image-preview"
@@ -161,6 +165,7 @@ def log_config_summary() -> None:
         f"  IMAGE_GENERATION        = {IMAGE_GENERATION_ENABLED}",
         f"  IMAGE_REFERENCE         = {IMAGE_REFERENCE_ENABLED}",
         f"  VISION_CHUNK_PLAN       = {VISION_CHUNK_PLAN_ENABLED}",
+        f"  REPORT_OUTLINE          = {REPORT_OUTLINE_ENABLED}",
         "  --- Infra ---",
         f"  MEMENTO_SERVICE_URL     = {MEMENTO_SERVICE_URL}",
         f"  SERVER_PORT             = {SERVER_PORT}",

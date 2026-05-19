@@ -65,6 +65,36 @@ def _download_docx(url: str) -> Path:
     return Path(tmp.name)
 
 
+# 업로드 자료가 저장되는 supabase storage bucket (memento 와 동일).
+# memento/storage/supabase_loader.py 의 ``storage.from_("files")`` 와 같은 bucket.
+STORAGE_FILES_BUCKET = "files"
+
+
+def _download_docx_from_storage(file_id: str) -> Path:
+    """Supabase storage 에서 file_id (= ``knowledge_files.source_ref`` = storage path)
+    로 직접 docx 본문을 받아 tempfile 로 저장.
+
+    URL 변환·HTTP 라운드트립 없이 ``storage.from_("files").download(path)`` 한 번으로 끝.
+    한글 파일명 URL 인코딩 이슈도 없음. signed URL 만료도 없음.
+    """
+    supabase = _get_supabase()
+    try:
+        data = supabase.storage.from_(STORAGE_FILES_BUCKET).download(file_id)
+    except Exception as exc:
+        raise RuntimeError(
+            f"supabase storage download failed (bucket={STORAGE_FILES_BUCKET}, path={file_id!r}): {exc}"
+        ) from exc
+    if not data:
+        raise RuntimeError(
+            f"supabase storage download returned empty (bucket={STORAGE_FILES_BUCKET}, path={file_id!r})"
+        )
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".docx")
+    tmp.write(data)
+    tmp.flush()
+    tmp.close()
+    return Path(tmp.name)
+
+
 def _has_outline_level(para) -> bool:
     try:
         ppr = para._p.pPr

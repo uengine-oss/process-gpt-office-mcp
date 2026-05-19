@@ -16,7 +16,7 @@ from fastmcp import FastMCP
 from pydantic import Field
 from supabase import create_client
 
-from .config import DEBUG_OUTPUT_DIR, DEBUG_OUTPUT_ENABLED, IMAGE_GENERATION_ENABLED, LLM_PROVIDER, LOG_PATH
+from .config import DEBUG_OUTPUT_DIR, DEBUG_OUTPUT_ENABLED, IMAGE_GENERATION_ENABLED, LOG_PATH
 from .formats.hwpx.runner import process_hwpx_file
 from .formats.hwpx.hwpx_to_html import hwpx_to_html
 from .formats.hwpx.hwpx_edit import apply_html_edits_to_hwpx
@@ -705,8 +705,9 @@ async def edit_hwpx_page_html(
 
 @mcp.tool
 async def generate_docx(
-    template_url: Annotated[str, Field(description="DOCX 템플릿 URL")],
     query: Annotated[str, Field(description="사용자 요청 / 리서치 주제")],
+    template_url: Annotated[Optional[str], Field(description="DOCX 템플릿의 http(s) URL. 외부 URL 인 경우만 사용. supabase storage 자료는 template_file_id 로.")] = "",
+    template_file_id: Annotated[Optional[str], Field(description="DOCX 템플릿의 supabase storage path (= knowledge_files.source_ref). bucket=files 에서 직접 다운로드. URL 변환 불필요.")] = "",
     sources_json: Annotated[Optional[str], Field(description="소스 목록 (JSON 직렬화된 list[dict])")] = "",
     outline_json: Annotated[Optional[str], Field(description="개요 목록 (JSON 직렬화된 list[str])")] = "",
     user_info_json: Annotated[Optional[str], Field(description="작성자 정보 (JSON 직렬화된 list[dict])")] = "",
@@ -719,16 +720,21 @@ async def generate_docx(
     user_email: Annotated[Optional[str], Field(description="사용자 이메일 (자동 주입)")] = "",
     room_id: Annotated[Optional[str], Field(description="채팅방 ID (자동 주입). 있으면 방에 업로드된 문서만 참조하며 드라이브 검색을 스킵한다.")] = "",
     proc_inst_id: Annotated[Optional[str], Field(description="프로세스 인스턴스 ID. 있으면 해당 프로세스에 ingest된 문서만 참조한다.")] = "",
+    file_ids_json: Annotated[Optional[str], Field(description="사용자가 명시 선택한 자료 file_id 목록 (JSON 직렬화된 list[str]). 비어있지 않으면 그 자료들에만 검색을 제한하며 room_id/proc_inst_id 보다 우선한다.")] = "",
 ) -> dict:
     """DOCX 템플릿을 LLM으로 채워 스토리지 URL로 반환한다.
 
-    사용자가 DOCX 작성을 요청하면 즉시 이 도구를 호출한다 (참고문서 선택 플로우 없음).
-    reference_documents가 비어 있으면 memento 전체 검색으로 관련 자료를 자동 조회한다.
+    템플릿 입력은 둘 중 하나:
+    - ``template_file_id``: supabase storage path (= ``knowledge_files.source_ref``). bucket=files 에서 직접 다운로드.
+      클라이언트(deep-agents-temp)가 사용자 선택 자료에서 자동 검출해 주입한다.
+    - ``template_url``: 외부 http(s) URL (Google Drive 공유 링크 등). file_id 가 없을 때만 사용.
+
+    참고문서 선택 플로우 없음 — reference_documents가 비어 있으면 memento 검색으로 자동 조회한다.
     """
-    if not template_url:
-        raise ValueError("template_url is required")
     if not query:
         raise ValueError("query is required")
+    if not (template_url or "").strip() and not (template_file_id or "").strip():
+        raise ValueError("template_url or template_file_id is required")
 
     import json as _json
     import uuid as _uuid
@@ -737,17 +743,31 @@ async def generate_docx(
     sources = _json.loads(sources_json) if sources_json else []
     outline = _json.loads(outline_json) if outline_json else []
 
+    # 명시 선택 자료 목록 파싱 — 비어있지 않으면 검색을 그 자료에 한정.
+    parsed_file_ids: list[str] = []
+    if file_ids_json:
+        try:
+            raw = _json.loads(file_ids_json)
+            if isinstance(raw, list):
+                parsed_file_ids = [str(x).strip() for x in raw if str(x).strip()]
+        except Exception as exc:
+            logger.warning("generate_docx: file_ids_json 파싱 실패 (%s) → 무시하고 진행", exc)
+
     # tenant_id가 있으면 memento에서 내부 지식 자료를 검색해 sources에 추가
     if (tenant_id or "").strip():
         try:
             from .memento import search_memento_smart
-            logger.info("generate_docx: memento RAG 검색 시작 (tenant_id=%s)", tenant_id)
+            logger.info(
+                "generate_docx: memento RAG 검색 시작 (tenant_id=%s, file_ids=%d)",
+                tenant_id, len(parsed_file_ids),
+            )
             memento_sources = await search_memento_smart(
                 query=query,
                 outline=outline if outline else [query],
                 tenant_id=tenant_id.strip(),
                 room_id=(room_id or "").strip() or None,
                 proc_inst_id=(proc_inst_id or "").strip() or None,
+                file_ids=parsed_file_ids or None,
             )
             if memento_sources:
                 sources = memento_sources + sources
@@ -773,13 +793,22 @@ async def generate_docx(
         _ascii_key += ".docx"
     storage_path = f"deep-research/{rid}/{_ascii_key}"
 
-    logger.info("generate_docx start: template=%s output=%s", template_url, safe_output)
+    template_source = (
+        f"file_id={template_file_id}" if (template_file_id or "").strip()
+        else f"url={template_url}"
+    )
+    logger.info("generate_docx start: template=%s output=%s", template_source, safe_output)
 
     from docx import Document as _Document
+    from .formats.docx.template import _download_docx_from_storage
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_dir_path = Path(tmp_dir)
-        template_path = _download_docx(template_url)
+        # file_id 우선 — supabase storage 에서 직접 다운로드 (URL 변환 없음).
+        if (template_file_id or "").strip():
+            template_path = _download_docx_from_storage(template_file_id.strip())
+        else:
+            template_path = _download_docx(template_url)
         doc = _Document(str(template_path))
         schema = extract_template_schema(doc)
 
@@ -1006,13 +1035,13 @@ async def save_docx_from_html(
     }
 
 
-# generate_slides 는 Gemini 이미지 생성에 의존하므로, 이미지 생성이 꺼져 있거나
-# LLM provider가 gemini가 아니면(폐쇄망 등) 도구 자체를 등록하지 않는다.
-_SLIDE_TOOL_ENABLED = bool(IMAGE_GENERATION_ENABLED) and LLM_PROVIDER == "gemini"
+# generate_slides 는 Gemini 이미지 생성에 의존하므로, 이미지 생성이 꺼져 있으면(폐쇄망 등)
+# 도구 자체를 등록하지 않는다. 본문 LLM(LLM_PROVIDER)과는 무관하다.
+_SLIDE_TOOL_ENABLED = bool(IMAGE_GENERATION_ENABLED)
 if not _SLIDE_TOOL_ENABLED:
     logger.info(
-        "generate_slides 도구 비활성화 (IMAGE_GENERATION_ENABLED=%s, LLM_PROVIDER=%s)",
-        IMAGE_GENERATION_ENABLED, LLM_PROVIDER,
+        "generate_slides 도구 비활성화 (IMAGE_GENERATION_ENABLED=%s)",
+        IMAGE_GENERATION_ENABLED,
     )
 
 _slide_tool_decorator = mcp.tool if _SLIDE_TOOL_ENABLED else (lambda f: f)

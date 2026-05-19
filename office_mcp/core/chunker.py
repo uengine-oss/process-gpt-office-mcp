@@ -5,8 +5,12 @@ from ..models import TextNode
 logger = logging.getLogger(__name__)
 
 # ── 청크 크기 제한 ──
-_MAX_CHUNK_NODES = 120   # 이 이상이면 이어붙이지 않음
-_MIN_CHUNK_NODES = 40    # 이 미만이면 인접 청크에 병합
+# 작은 모델(gpt-oss-120b 등)이 한 응답에서 너무 많은 노드를 채우다 게으름을
+# 부리는 걸 막기 위해 보수적으로 잡는다. 단 "노드 수"는 안전망일 뿐, 실제 fill
+# 부담은 fillable 노드 수 × 응답 길이 — runner에서 fill 단계에 sub-batch로 한
+# 번 더 분할한다.
+_MAX_CHUNK_NODES = 30    # 이 이상이면 이어붙이지 않음
+_MIN_CHUNK_NODES = 10    # 이 미만이면 인접 청크에 병합
 
 
 def _is_heading(node: TextNode) -> bool:

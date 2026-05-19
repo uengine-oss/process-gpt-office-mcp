@@ -10,11 +10,13 @@ from pathlib import Path
 
 from ...agent.agent import (
     agent_analyze_chunk,
+    agent_build_report_outline,
     agent_fill_chunk,
     agent_generate_rag_queries,
     agent_judge_image_reference,
     agent_select_reference_images,
     agent_select_source_chunks,
+    render_outline_for_prompt,
 )
 from ...memento import (
     search_memento_multi_query,
@@ -32,6 +34,7 @@ from ...config import (
     IMAGE_REFERENCE_ENABLED,
     LLM_VISION_ENABLED,
     MAX_CONCURRENT_LLM,
+    REPORT_OUTLINE_ENABLED,
     VISION_CHUNK_PLAN_ENABLED,
 )
 from ...core.chunker import chunk_nodes_semantic
@@ -252,6 +255,168 @@ def _merge_small_chunks(chunks: list[list], min_nodes: int = _MIN_CHUNK_NODES) -
 _IMAGE_MARKER_RE = re.compile(r"\[IMAGE(?::([^\]]+))?\]")
 
 
+# fill 단계 sub-batch 한도. 한 LLM 호출이 한 번에 책임질 fillable 노드 수.
+# gpt-oss-120b 같은 작은 모델이 "this is huge → empty array"로 도망치는 것을
+# 막기 위한 안전선. 표는 횡적 정합성을 위해 절대 분할하지 않으므로 이 한도를
+# 살짝 넘는 큰 표는 한 batch에 통째로 들어간다.
+_FILL_BATCH_MAX = 12
+
+
+def _split_fillable_into_batches(
+    chunk: list,
+    analysis: dict,
+    max_batch: int = _FILL_BATCH_MAX,
+) -> list[list[int]]:
+    """청크의 fillable 노드 ID를 작은 batch로 분할.
+
+    규칙:
+      - analysis에서 action=write/replace 이고 skip_fill=false 인 ID만 대상.
+      - 청크의 노드 등장 순서를 유지.
+      - 같은 table_idx의 셀들은 절대 분할하지 않고 한 batch에 통째로 묶음.
+      - 본문(또는 표 종료) 경계에서 batch 크기가 max_batch를 넘었으면 flush.
+      - 큰 표 하나가 max_batch보다 커도 그 표 자체는 자르지 않음.
+    """
+    if not isinstance(analysis, dict):
+        return []
+    fill_ids: set[int] = set()
+    for item in (analysis.get("nodes") or []):
+        if item.get("skip_fill"):
+            continue
+        action = (item.get("action") or "").lower()
+        if action not in ("write", "replace"):
+            continue
+        nid = item.get("id")
+        if isinstance(nid, str) and nid.isdigit():
+            nid = int(nid)
+        if isinstance(nid, int):
+            fill_ids.add(nid)
+
+    if not fill_ids:
+        return []
+
+    batches: list[list[int]] = []
+    current: list[int] = []
+    current_table: int = -1  # 현재 batch가 처리 중인 table_idx (-1=표 아님)
+
+    def _flush() -> None:
+        nonlocal current
+        if current:
+            batches.append(current)
+            current = []
+
+    for node in chunk:
+        if node.id not in fill_ids:
+            continue
+        is_table = getattr(node, "type", "") == "table_cell" and node.table_idx >= 0
+        new_table = node.table_idx if is_table else -1
+
+        # 표 경계(다른 표/표→본문/본문→표)에서 batch 한도 넘으면 flush
+        if new_table != current_table and current and len(current) >= max_batch:
+            _flush()
+
+        current.append(node.id)
+        current_table = new_table
+
+        # 표 안이 아닐 때만 한도 즉시 체크 (표 진행 중이면 끝까지 모음)
+        if current_table < 0 and len(current) >= max_batch:
+            _flush()
+
+    _flush()
+    return batches
+
+
+# 결과물에 남아있으면 안 되는 일반적인 placeholder 패턴.
+# (양식의 <hp:t> 텍스트만 추출한 뒤 검사하므로 XML 태그와 섞이지 않는다.)
+_GENERIC_PLACEHOLDER_PATTERNS = (
+    re.compile(r"\[[^\]\n]{1,40}\]"),               # [xxxx]  ([IMAGE 마커는 fill 단계에서 이미 제거됨)
+    re.compile(r"<[가-힣A-Za-z0-9 _·\-/]{1,30}>"),    # <xxxx>
+    re.compile(r"YYYY|MM월|DD일|YY년"),
+    re.compile(r"○○+|XX+|xx+|\bTBD\b|\bTODO\b"),
+)
+
+
+def _collect_original_placeholder_texts(
+    nodes_per_section: list[list],
+) -> set[str]:
+    """원본 양식 노드 중 '교체 대상으로 보이는' 텍스트를 수집.
+
+    repack 후 출력에 똑같은 문자열이 그대로 남아있으면 fill 실패 신호.
+    완전 일치 검사라 false positive가 거의 없다.
+    """
+    suspicious: set[str] = set()
+    for nodes in nodes_per_section:
+        for n in nodes:
+            text = (getattr(n, "text", None) or getattr(n, "raw_text", None) or "").strip()
+            if not text or len(text) > 60:
+                continue
+            for pat in _GENERIC_PLACEHOLDER_PATTERNS:
+                if pat.search(text):
+                    suspicious.add(text)
+                    break
+    return suspicious
+
+
+_HP_T_RE = re.compile(r"<hp:t[^/>]*>([^<]*)</hp:t>")
+
+
+def _verify_output_placeholders(
+    output_path: str,
+    expected_replaced: set[str],
+) -> None:
+    """repack 직후 출력 hwpx 안에 placeholder가 살아남았는지 검사.
+
+    심각한 잔존만 WARNING으로 로그 — 사용자/QA가 결과물을 보기 전에 우리가 먼저 안다.
+    """
+    import zipfile as _zf
+
+    leftover_known: dict[str, int] = {}
+    leftover_generic: dict[str, int] = {}
+
+    try:
+        with _zf.ZipFile(output_path, "r") as zf:
+            section_names = [n for n in zf.namelist() if re.match(r"Contents/section.*\.xml$", n, re.IGNORECASE)]
+            for name in section_names:
+                xml_bytes = zf.read(name)
+                try:
+                    xml_text = xml_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+                texts = _HP_T_RE.findall(xml_text)
+                joined = "\n".join(texts)
+                # 1) 원본 양식에 있던 의심 텍스트가 그대로 살아남았는가
+                for t in expected_replaced:
+                    if t in joined:
+                        leftover_known[t] = leftover_known.get(t, 0) + joined.count(t)
+                # 2) 일반 패턴 잔존 검사 (원본에 없던 새 placeholder가 LLM에 의해 생성된 경우 포함)
+                for pat in _GENERIC_PLACEHOLDER_PATTERNS:
+                    for m in pat.findall(joined):
+                        if not isinstance(m, str):
+                            continue
+                        leftover_generic[m] = leftover_generic.get(m, 0) + 1
+    except Exception as exc:
+        logger.warning("[검증] 출력 검사 실패 (계속 진행): %s", exc)
+        return
+
+    if not leftover_known and not leftover_generic:
+        logger.info("[검증] OK — 잔존 placeholder 없음")
+        return
+
+    if leftover_known:
+        sample = sorted(leftover_known.items(), key=lambda x: -x[1])[:10]
+        logger.warning(
+            "[검증] ⚠ 원본 placeholder %d종이 출력에 그대로 남아있음 (총 %d회). 샘플: %s",
+            len(leftover_known), sum(leftover_known.values()),
+            ", ".join(f"{t!r}×{c}" for t, c in sample),
+        )
+    if leftover_generic:
+        sample = sorted(leftover_generic.items(), key=lambda x: -x[1])[:10]
+        logger.warning(
+            "[검증] ⚠ placeholder 패턴 %d종이 출력에 잔존 (총 %d회). 샘플: %s",
+            len(leftover_generic), sum(leftover_generic.values()),
+            ", ".join(f"{t!r}×{c}" for t, c in sample),
+        )
+
+
 def _cell_range(col: int, span: int) -> tuple[int, int]:
     span = max(1, span)
     return col, col + span - 1
@@ -435,13 +600,57 @@ async def process_hwpx_file(
         domain_type = "generic"
         domain_guide = ""
         first_section_nodes = None
+        all_section_nodes_for_outline: list[list] = []
         for sf_tmp in section_files:
-            first_section_nodes, _, _, _ = parse_section(sf_tmp, style_maps=style_maps)
-            if first_section_nodes:
-                break
+            sec_nodes, _, _, _ = parse_section(sf_tmp, style_maps=style_maps)
+            if sec_nodes:
+                if first_section_nodes is None:
+                    first_section_nodes = sec_nodes
+                all_section_nodes_for_outline.append(sec_nodes)
         if first_section_nodes:
             domain_type, domain_guide = await detect_domain(first_section_nodes)
         logger.info("[도메인] 감지 결과: type=%s, guide_len=%d", domain_type, len(domain_guide))
+
+        # 검증용: 원본 양식에서 placeholder로 추정되는 텍스트 수집 (repack 후 잔존 검사에 사용)
+        original_placeholder_texts = _collect_original_placeholder_texts(
+            all_section_nodes_for_outline
+        )
+        if original_placeholder_texts:
+            logger.info(
+                "[검증] 원본 placeholder 후보 %d종 사전 수집 — repack 후 잔존 검사에 사용",
+                len(original_placeholder_texts),
+            )
+
+        # ── 글로벌 스토리라인 (outline) 사전 빌드 ──
+        # fill 청크가 병렬로 돌면서 어조·고유명사·메시지가 어긋나는 문제를
+        # 막기 위해 문서 전체를 한 번 보고 일관된 outline을 결정한다.
+        outline_text = ""
+        if REPORT_OUTLINE_ENABLED and all_section_nodes_for_outline:
+            try:
+                t_outline = time.perf_counter()
+                outline = await agent_build_report_outline(
+                    all_section_nodes_for_outline,
+                    report_topic=report_topic,
+                    report_description=report_description,
+                    reference_text=reference_text,
+                    domain_type=domain_type,
+                )
+                outline_text = render_outline_for_prompt(outline)
+                logger.info(
+                    "[outline] 빌드 완료 — sections=%d, key_entities=%d, plans=%d, len=%d, %.1fs",
+                    len(all_section_nodes_for_outline),
+                    len((outline or {}).get("key_entities") or []),
+                    len((outline or {}).get("section_plans") or []),
+                    len(outline_text),
+                    time.perf_counter() - t_outline,
+                )
+                if DEBUG_OUTPUT_ENABLED and outline_text:
+                    debug_dir = Path(__file__).resolve().parent.parent.parent / DEBUG_OUTPUT_DIR
+                    debug_dir.mkdir(parents=True, exist_ok=True)
+                    (debug_dir / "outline.txt").write_text(outline_text, encoding="utf-8")
+            except Exception as exc:
+                logger.warning("[outline] 빌드 실패 (계속 진행): %s", exc)
+                outline_text = ""
 
         logger.info("HWPX sections=%d", len(section_files))
         for sf in section_files:
@@ -498,12 +707,14 @@ async def process_hwpx_file(
                 async with sem:
                     analysis = await agent_analyze_chunk(
                         chunk,
+                        chunk_idx=chunk_idx,
                         report_description=report_description,
                         table_summaries=table_summaries,
                         chunk_image_b64=chunk_image_b64,
                         prev_chunk=prev_chunk,
                         domain_type=domain_type,
                         next_chunk=next_chunk,
+                        outline_text=outline_text,
                     )
                 logger.info("[청크처리] 청크 %d: agent_analyze_chunk 완료", chunk_idx)
                 analysis = _inject_role_pairs(analysis, chunk)
@@ -727,14 +938,57 @@ async def process_hwpx_file(
                         logger.warning("[소스참고] 청크 %d: 선택 실패 — %s", chunk_idx, exc)
 
                 # ── ③ 오버라이드 반영된 analysis로 fill 생성 ──
-                async with sem:
-                    filled = await agent_fill_chunk(
-                        analysis,
-                        chunk,
-                        report_topic=report_topic,
-                        report_description=report_description,
-                        reference_text=chunk_reference,
-                        domain_guide=domain_guide,
+                # gpt-oss-120b 같은 작은 모델이 한 응답에 30+ 노드를 다 채우다 게으름을
+                # 부리는 걸 막기 위해, fillable 노드를 _FILL_BATCH_MAX 단위로 sub-batch
+                # 분할하여 병렬 호출. 표는 횡적 정합성을 위해 통째로 한 batch에 들어감.
+                fill_batches = _split_fillable_into_batches(chunk, analysis)
+
+                async def _fill_one_batch(target_ids: list[int]) -> dict:
+                    """한 batch fill 호출 + 빈 응답 시 1회 재시도."""
+                    for attempt in (1, 2):
+                        async with sem:
+                            res = await agent_fill_chunk(
+                                analysis,
+                                chunk,
+                                report_topic=report_topic,
+                                report_description=report_description,
+                                reference_text=chunk_reference,
+                                domain_guide=domain_guide,
+                                outline_text=outline_text,
+                                target_ids=target_ids,
+                            )
+                        fills_in = res.get("fills") if isinstance(res, dict) else None
+                        if isinstance(fills_in, list) and len(fills_in) > 0:
+                            return res
+                        logger.warning(
+                            "[fill 빈응답] 청크 %d: target_ids=%s attempt=%d/2 — 재시도",
+                            chunk_idx, target_ids, attempt,
+                        )
+                    return res if isinstance(res, dict) else {"fills": []}
+
+                if not fill_batches:
+                    filled = {"fills": []}
+                else:
+                    logger.info(
+                        "[fill 분할] 청크 %d: fillable=%d → %d개 batch (크기: %s)",
+                        chunk_idx,
+                        sum(len(b) for b in fill_batches),
+                        len(fill_batches),
+                        [len(b) for b in fill_batches],
+                    )
+                    sub_results = await asyncio.gather(*[
+                        _fill_one_batch(batch) for batch in fill_batches
+                    ])
+                    merged_fills: list[dict] = []
+                    for r in sub_results:
+                        if isinstance(r, dict):
+                            for f in (r.get("fills") or []):
+                                if isinstance(f, dict):
+                                    merged_fills.append(f)
+                    filled = {"fills": merged_fills}
+                    logger.info(
+                        "[fill 분할] 청크 %d: %d batch 결과 merge → fills %d개",
+                        chunk_idx, len(fill_batches), len(merged_fills),
                     )
 
                 # ── ④ category_map / action_map 수집 ──
@@ -1140,6 +1394,9 @@ async def process_hwpx_file(
             original_compress_info=compress_info,
             original_file_order=file_order,
         )
+
+        # 결과물 placeholder 잔존 검증 — fill 누락/실패의 조기 경보
+        _verify_output_placeholders(output_path, original_placeholder_texts)
 
     # 디버그: 완성본 hwpx + HTML 저장
     if DEBUG_OUTPUT_ENABLED:

@@ -317,6 +317,180 @@ def _render_nodes_for_plan(nodes: list[TextNode]) -> str:
     return "\n".join(n.display() for n in nodes)
 
 
+# ─────────────────────────────────────────────────────────────────
+# 글로벌 outline pre-pass
+# ─────────────────────────────────────────────────────────────────
+#
+# 청크별 fill은 다른 청크에서 어떤 내용이 들어갈지 모르기 때문에
+# - 같은 고유명사/수치를 청크마다 다르게 표기
+# - 결론 청크가 본문 청크의 핵심 메시지를 회수하지 못함
+# - 표·본문 간 횡적 정합성(예: 본문에서 GPT-6 언급 → 표에서 GPT-5 등장) 깨짐
+# 같은 문제가 흔하다.
+#
+# 이를 막기 위해 fill 시작 전에 LLM이 한 번 전체 노드 윤곽을 보고
+# "이 보고서를 어떻게 끌고 갈지" 미리 결정하도록 한다. 결과는 짧은 텍스트로
+# 모든 chunk analyze/fill 프롬프트에 주입된다.
+
+_OUTLINE_SCHEMA = {
+    "name": "report_outline",
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "title": {"type": "string"},
+            "subtitle": {"type": "string"},
+            "key_message": {"type": "string"},
+            "narrative_arc": {"type": "string"},
+            "key_entities": {"type": "array", "items": {"type": "string"}},
+            "section_plans": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "heading": {"type": "string"},
+                        "intent": {"type": "string"},
+                        "must_mention": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["heading", "intent", "must_mention"],
+                },
+            },
+        },
+        "required": [
+            "title", "subtitle", "key_message",
+            "narrative_arc", "key_entities", "section_plans",
+        ],
+    },
+}
+
+
+def _render_nodes_for_outline(nodes_per_section: list[list[TextNode]], max_chars: int = 12000) -> str:
+    """outline 프롬프트용 — 전체 노드를 압축해서 보여준다.
+
+    너무 길면 자르되, 표/제목/본문이 골고루 살아남도록 한다.
+    """
+    parts: list[str] = []
+    for sec_i, nodes in enumerate(nodes_per_section):
+        parts.append(f"### Section {sec_i}")
+        for n in nodes:
+            text = (n.text or n.raw_text or "").strip()
+            text = text[:80] + ("..." if len(text) > 80 else "")
+            if n.type == "table_cell":
+                parts.append(f"  [T{n.table_idx} R{n.row}C{n.col}] {text or '<빈>'}")
+            else:
+                parts.append(f"  [본문] {text}" if text else "  [본문] <빈>")
+    rendered = "\n".join(parts)
+    if len(rendered) > max_chars:
+        # 앞 70% + 뒤 30% 보존 (도입과 결론을 모두 보기 위해)
+        head = int(max_chars * 0.7)
+        tail = max_chars - head - 20
+        rendered = rendered[:head] + "\n... (중략) ...\n" + rendered[-tail:]
+    return rendered
+
+
+def render_outline_for_prompt(outline: dict | None) -> str:
+    """outline dict를 chunk 프롬프트에 끼워 넣을 텍스트로 변환."""
+    if not isinstance(outline, dict) or not outline:
+        return ""
+    title = (outline.get("title") or "").strip()
+    subtitle = (outline.get("subtitle") or "").strip()
+    key_msg = (outline.get("key_message") or "").strip()
+    arc = (outline.get("narrative_arc") or "").strip()
+    entities = outline.get("key_entities") or []
+    plans = outline.get("section_plans") or []
+    lines = ["## 문서 전체 스토리라인 (모든 청크 공통 — 반드시 정합성 유지)"]
+    if title:
+        lines.append(f"- 제목: {title}")
+    if subtitle:
+        lines.append(f"- 부제: {subtitle}")
+    if key_msg:
+        lines.append(f"- 핵심 메시지: {key_msg}")
+    if arc:
+        lines.append(f"- 전체 흐름: {arc}")
+    if isinstance(entities, list) and entities:
+        ents = ", ".join(str(e) for e in entities[:20])
+        lines.append(f"- 일관 사용 고유명사/수치: {ents}")
+    if isinstance(plans, list) and plans:
+        lines.append("- 섹션별 계획:")
+        for p in plans[:20]:
+            if not isinstance(p, dict):
+                continue
+            heading = (p.get("heading") or "").strip()
+            intent = (p.get("intent") or "").strip()
+            must = p.get("must_mention") or []
+            must_str = (" | 필수: " + ", ".join(str(m) for m in must[:5])) if must else ""
+            lines.append(f"  · {heading}: {intent}{must_str}")
+    lines.append(
+        "★ 위 스토리라인을 벗어나거나 모순되는 표현은 금지. "
+        "고유명사/수치는 위 목록 그대로 사용하고, 새 사실을 추가로 만들어내지 말 것."
+    )
+    return "\n".join(lines)
+
+
+async def agent_build_report_outline(
+    nodes_per_section: list[list[TextNode]],
+    report_topic: str,
+    report_description: str = "",
+    reference_text: str = "",
+    domain_type: str = "generic",
+) -> dict:
+    """문서 전체를 한 번 훑어 일관된 스토리라인을 결정한다.
+
+    fill 단계 전에 1회 호출. 결과 dict는 render_outline_for_prompt()로
+    렌더링되어 모든 analyze/fill 프롬프트에 컨텍스트로 주입된다.
+    """
+    if not nodes_per_section:
+        return {}
+    doc_view = _render_nodes_for_outline(nodes_per_section)
+
+    ref_section = ""
+    if reference_text:
+        snippet = reference_text[:4000]
+        ref_section = f"\n## 참고 텍스트 (요약 작성에 활용)\n{snippet}\n"
+
+    desc_section = f"\n## 사용자 보고서 설명\n{report_description}\n" if report_description else ""
+
+    prompt_sys = (
+        "당신은 한국어 보고서 기획 편집자입니다. "
+        "주어진 양식의 전체 구조를 파악하고, 본문을 채우기 전에 "
+        "보고서 전체에서 일관되게 유지할 스토리라인·고유명사·핵심 메시지를 결정합니다. "
+        "JSON만 출력하세요."
+    )
+    prompt_user = f"""## 보고서 주제
+{report_topic}
+{desc_section}{ref_section}
+## 양식 전체 구조 (노드 요약)
+{doc_view}
+
+## 작업
+이 양식이 모두 채워졌을 때의 보고서가 일관된 한 편의 글이 되도록 "스토리라인"을 먼저 정하세요.
+- title/subtitle: 표지에 들어갈 제목·부제 (양식이 비워둔 경우 생성)
+- key_message: 보고서 전체가 전달하려는 한 문장 결론
+- narrative_arc: 도입→본문→결론으로 어떻게 흘러갈지 2-3문장 요약
+- key_entities: 본문 전체에서 일관되게 등장시킬 고유명사·핵심 수치 (회사명·모델명·기간·지표 등). 청크별로 표기가 흔들리지 않도록 여기서 못 박는다.
+- section_plans: 양식의 주요 섹션마다 어떤 내용을 다룰지 1-2줄 의도 + must_mention(반드시 포함할 키워드 1-3개)
+
+지침:
+- 도메인: {domain_type}
+- 참고 텍스트가 있다면 거기서 실제 사실을 우선 사용하라. 참고 텍스트가 비어있으면 합리적으로 가정해 일관성을 유지하라.
+- 양식의 표·소제목 구조에서 추론할 수 있는 섹션을 모두 section_plans에 넣어라.
+- 새 사실을 만들기보다, 양식 자체와 사용자 요청에서 자연스럽게 도출되는 내용에 집중하라.
+
+## 출력(JSON만)
+{{"title":"...","subtitle":"...","key_message":"...","narrative_arc":"...","key_entities":["..."],"section_plans":[{{"heading":"...","intent":"...","must_mention":["..."]}}]}}
+"""
+    try:
+        result = await asyncio.to_thread(
+            _call_llm_json, prompt_sys, prompt_user, 0.3, _OUTLINE_SCHEMA,
+        )
+    except Exception as exc:
+        logger.warning("[outline] LLM 호출 실패: %s — outline 없이 진행", exc)
+        return {}
+    if not isinstance(result, dict):
+        return {}
+    return result
+
+
 async def agent_chunk_plan(
     nodes: list[TextNode],
     table_summaries: list[TableSummary] | None = None,
@@ -464,6 +638,7 @@ async def agent_analyze_chunk(
     prev_chunk: list[TextNode] | None = None,
     next_chunk: list[TextNode] | None = None,
     domain_type: str = "generic",
+    outline_text: str = "",
 ) -> dict:
     llm_nodes = _filter_llm_nodes(nodes)
     doc_view = _render_nodes_html(llm_nodes)
@@ -512,7 +687,10 @@ async def agent_analyze_chunk(
     # 프로젝트 정보
     project_section = f"## 프로젝트 정보\n{report_description}\n\n" if report_description else ""
 
-    prompt_user = f"""{project_section}## 문서 청크
+    # 글로벌 스토리라인 (모든 청크 공통)
+    outline_section = f"\n{outline_text}\n" if outline_text else ""
+
+    prompt_user = f"""{project_section}{outline_section}## 문서 청크
 {doc_view}
 {table_summary_section}{context_section}
 {category_and_examples}
@@ -615,7 +793,14 @@ async def agent_fill_chunk(
     report_description: str = "",
     reference_text: str = "",
     domain_guide: str = "",
+    outline_text: str = "",
+    target_ids: list[int] | None = None,
 ) -> dict:
+    """청크의 fillable 노드에 들어갈 텍스트를 LLM으로 작성.
+
+    target_ids가 주어지면 그 ID들만 작성한다 (sub-batch 분할 시 사용).
+    None이면 청크 내 모든 fillable 노드를 작성.
+    """
     llm_nodes = _filter_llm_nodes(nodes)
     doc_view = _render_nodes_html(llm_nodes)
     analysis_view = json.dumps(analysis, ensure_ascii=False, indent=2)
@@ -657,18 +842,38 @@ async def agent_fill_chunk(
         )
         example_fill = '{"id":307,"new_text":"...","source_refs":[0,3]}'
 
+    # 글로벌 스토리라인 (모든 청크 공통)
+    outline_section = f"\n{outline_text}\n" if outline_text else ""
+
+    # sub-batch 분할 모드: 이번 호출에서 작성할 ID만 제한
+    target_section = ""
+    target_count_hint = ""
+    if target_ids:
+        ids_str = ", ".join(str(i) for i in sorted(set(target_ids)))
+        target_section = (
+            f"\n## ★ 이번 호출에서 작성할 노드 ID (반드시 이 ID들만, 빠짐없이)\n[{ids_str}]\n"
+        )
+        target_count_hint = f" 정확히 {len(set(target_ids))}개 항목을 작성해야 합니다."
+
+    # 빈 응답 방지 — gpt-oss류가 "This is huge → empty array" 도망가는 것을 막음
+    no_skip_rule = (
+        "\n절대 빈 배열을 반환하지 마세요. 분량이 많아 보여도 모든 대상 노드를 빠짐없이 작성하세요."
+        " 각 셀/문단의 분량은 data-size에 맞게 짧게 써도 되지만, 빈칸으로 두거나 생략은 금지."
+        f"{target_count_hint}"
+    )
+
     prompt_user = f"""## 보고서 주제
 {report_topic}
-{domain_section}{ref_section}
+{domain_section}{outline_section}{ref_section}
 ## 문서(HTML)
 {doc_view}
 
 ## 분석 결과
 {analysis_view}
-
+{target_section}
 ## 작업
 action=write/replace이고 skip_fill=false인 노드만 작성. id는 data-id 값 그대로 사용.
-표 셀은 data-size에 맞게 분량 조절.
+표 셀은 data-size에 맞게 분량 조절.{no_skip_rule}
 {footnote_rule}{image_rule}{source_rule}
 
 ## 출력(JSON만, 설명 없이)
