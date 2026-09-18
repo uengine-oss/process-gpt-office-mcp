@@ -227,9 +227,14 @@ def _parse_header(zipf: zipfile.ZipFile):
             style_map["font-weight"] = "700"
         if char_pr.find("hh:italic", NS) is not None:
             style_map["font-style"] = "italic"
+        # HWPX 는 밑줄/취소선이 '없음' 이어도 요소를 항상 기록한다
+        #   <hh:underline type="NONE" .../> , <hh:strikeout shape="NONE" .../>
+        # 따라서 요소 존재만으로 장식을 넣으면 모든 글자에 밑줄/취소선이 붙는다.
+        # 밑줄은 type, 취소선은 shape 가 NONE 이 아닐 때만 적용한다.
+        decorations: list[str] = []
         underline = char_pr.find("hh:underline", NS)
-        if underline is not None:
-            style_map["text-decoration-line"] = "underline"
+        if underline is not None and (underline.attrib.get("type") or "").upper() not in ("", "NONE"):
+            decorations.append("underline")
             style_map["text-decoration-color"] = _normalize_color_bgr(
                 underline.attrib.get("color")
             )
@@ -240,8 +245,11 @@ def _parse_header(zipf: zipfile.ZipFile):
                 style_map["text-decoration-style"] = "dotted"
             else:
                 style_map["text-decoration-style"] = "solid"
-        if char_pr.find("hh:strikeout", NS) is not None:
-            style_map["text-decoration-line"] = "line-through"
+        strikeout = char_pr.find("hh:strikeout", NS)
+        if strikeout is not None and (strikeout.attrib.get("shape") or "").upper() not in ("", "NONE"):
+            decorations.append("line-through")
+        if decorations:
+            style_map["text-decoration-line"] = " ".join(decorations)
 
         char_styles[char_id] = style_map
 

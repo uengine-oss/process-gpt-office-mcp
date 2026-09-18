@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import logging
 import os
 import re
@@ -82,6 +83,8 @@ logger = _setup_logging()
 DEBUG_OUTPUT_PATH = Path(__file__).resolve().parent / DEBUG_OUTPUT_DIR
 from .config import SUPABASE_URL, SUPABASE_KEY
 SUPABASE_BUCKET = "deep_research_files"
+# deepagents 스킬 산출물 전용 버킷(deep-research 와 분리 — 경로에 deepagent 가 드러나게).
+DEEPAGENT_BUCKET = "deepagent_files"
 HWPX_CONTENT_TYPE = "application/vnd.hancom.hwpx"
 HTML_CONTENT_TYPE = "text/html; charset=utf-8"
 
@@ -226,36 +229,36 @@ def _extract_public_url(response: object) -> Optional[str]:
     return None
 
 
-def _upload_hwpx_to_storage(file_path: Path, output_name: str) -> str:
+def _upload_hwpx_to_storage(file_path: Path, output_name: str, bucket: str = SUPABASE_BUCKET) -> str:
     if not SUPABASE_URL or not SUPABASE_KEY:
         raise RuntimeError("SUPABASE_URL 또는 SUPABASE_KEY가 설정되지 않았습니다.")
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     safe_name = _safe_storage_name(output_name)
     storage_path = f"hwpx/{uuid.uuid4().hex}_{safe_name}"
     file_bytes = file_path.read_bytes()
-    resp = supabase.storage.from_(SUPABASE_BUCKET).upload(
+    resp = supabase.storage.from_(bucket).upload(
         storage_path,
         file_bytes,
         {"content-type": HWPX_CONTENT_TYPE, "upsert": "true"},
     )
     if hasattr(resp, "path") and not resp.path:
         raise RuntimeError(f"storage 업로드 실패: 응답 path 없음 {resp}")
-    public = supabase.storage.from_(SUPABASE_BUCKET).get_public_url(storage_path)
+    public = supabase.storage.from_(bucket).get_public_url(storage_path)
     url = _extract_public_url(public)
     if url:
         return url
     base_url = SUPABASE_URL.rstrip("/")
-    return f"{base_url}/storage/v1/object/public/{SUPABASE_BUCKET}/{quote(storage_path, safe='/-_.')}"
+    return f"{base_url}/storage/v1/object/public/{bucket}/{quote(storage_path, safe='/-_.')}"
 
 
-def _upload_html_to_storage(file_path: Path, output_name: str) -> str:
+def _upload_html_to_storage(file_path: Path, output_name: str, bucket: str = SUPABASE_BUCKET) -> str:
     if not SUPABASE_URL or not SUPABASE_KEY:
         raise RuntimeError("SUPABASE_URL 또는 SUPABASE_KEY가 설정되지 않았습니다.")
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     safe_name = _safe_html_name(output_name)
     storage_path = f"hwpx_html/{uuid.uuid4().hex}_{safe_name}"
     file_bytes = file_path.read_bytes()
-    resp = supabase.storage.from_(SUPABASE_BUCKET).upload(
+    resp = supabase.storage.from_(bucket).upload(
         storage_path,
         file_bytes,
         {
@@ -267,12 +270,12 @@ def _upload_html_to_storage(file_path: Path, output_name: str) -> str:
     )
     if hasattr(resp, "path") and not resp.path:
         raise RuntimeError(f"storage 업로드 실패: 응답 path 없음 {resp}")
-    public = supabase.storage.from_(SUPABASE_BUCKET).get_public_url(storage_path)
+    public = supabase.storage.from_(bucket).get_public_url(storage_path)
     url = _extract_public_url(public)
     if url:
         return url
     base_url = SUPABASE_URL.rstrip("/")
-    return f"{base_url}/storage/v1/object/public/{SUPABASE_BUCKET}/{quote(storage_path, safe='/-_.')}"
+    return f"{base_url}/storage/v1/object/public/{bucket}/{quote(storage_path, safe='/-_.')}"
 
 
 
@@ -515,6 +518,62 @@ async def generate_hwpx(
             logger.warning("HTML 변환 실패 (HWPX만 반환)")
 
     logger.info("generate_hwpx done: output=%s url=%s", output_name, file_url)
+    return {
+        "file_name": output_name,
+        "content_type": HWPX_CONTENT_TYPE,
+        "file_url": file_url,
+        "html_name": output_html_name if html_url else "",
+        "html_content_type": HTML_CONTENT_TYPE if html_url else "",
+        "html_url": html_url,
+    }
+
+
+@mcp.tool
+async def store_and_render_hwpx(
+    base64_data: Annotated[str, Field(description="이미 생성된 HWPX 파일 바이트의 base64 인코딩 문자열")],
+    file_name: Annotated[Optional[str], Field(description="원본 파일명 (예: output.hwpx)")] = "output.hwpx",
+    tenant_id: Annotated[Optional[str], Field(description="테넌트 ID (자동 주입)")] = "",
+    user_jwt: Annotated[Optional[str], Field(description="사용자 JWT (자동 주입)")] = "",
+    user_uid: Annotated[Optional[str], Field(description="사용자 UID (자동 주입)")] = "",
+    user_email: Annotated[Optional[str], Field(description="사용자 이메일 (자동 주입)")] = "",
+) -> dict:
+    """외부에서 자체 생성한 HWPX 바이트(base64)를 받아 스토리지 업로드 + 편집용 HTML 변환을 수행한다.
+
+    deepagents 등이 스킬로 만든 .hwpx 를 기존 HWPX 뷰어/편집 UI(file_url + html_url)에 그대로
+    태우기 위한 통로. 생성 로직은 호출자(스킬)가 하고, 여기서는 저장/HTML변환만 담당한다.
+    반환 형식은 generate_hwpx 와 동일(file_url/html_url)하므로 프론트가 동일하게 처리한다.
+    """
+    if not base64_data:
+        raise ValueError("base64_data is required")
+    try:
+        raw = base64.b64decode(base64_data)
+    except Exception as exc:
+        raise ValueError(f"invalid base64_data: {exc}")
+    if not raw:
+        raise ValueError("base64_data decoded to empty bytes")
+
+    base_name = _build_edit_basename(file_name or "output.hwpx")
+    output_name = f"{base_name}.hwpx"
+    output_html_name = f"{base_name}.html"
+    logger.info("store_and_render_hwpx start: name=%s bytes=%d", output_name, len(raw))
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_dir_path = Path(tmp_dir)
+        output_path = tmp_dir_path / output_name
+        html_output_path = tmp_dir_path / output_html_name
+        output_path.write_bytes(raw)
+
+        file_url = _upload_hwpx_to_storage(output_path, output_name, bucket=DEEPAGENT_BUCKET)
+
+        html_url = ""
+        try:
+            hwpx_to_html(output_path, html_output_path, use_lineseg=False, inject_ids=True)
+            html_url = _upload_html_to_storage(html_output_path, output_html_name, bucket=DEEPAGENT_BUCKET)
+        except Exception as e:
+            logger.warning("store_and_render_hwpx: HTML 변환 실패 (HWPX만 반환): %s", e)
+            html_url = ""
+
+    logger.info("store_and_render_hwpx done: output=%s url=%s html=%s", output_name, file_url, html_url)
     return {
         "file_name": output_name,
         "content_type": HWPX_CONTENT_TYPE,
