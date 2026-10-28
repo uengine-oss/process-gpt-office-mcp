@@ -188,13 +188,13 @@ class OpenAIProvider(LLMProvider):
         self._client = OpenAI(**kwargs)
         self._model = model_name
         self._reasoning_effort = reasoning_effort  # "low", "medium", "high", or None
-        # gpt-5*, o1*, o3* 계열은 max_tokens 미지원 → max_completion_tokens 사용
+        # 추론 모델(gpt-5*·gpt-6*·o*)은 max_tokens·temperature 미지원 → max_completion_tokens, temperature 생략
         m = (model_name or "").lower()
-        self._max_tokens_key = (
-            "max_completion_tokens"
-            if m.startswith(("gpt-5", "o1", "o3"))
-            else "max_tokens"
-        )
+        self._reasoning_model = m.startswith(("gpt-5", "gpt-6", "o1", "o3", "o4"))
+        self._max_tokens_key = "max_completion_tokens" if self._reasoning_model else "max_tokens"
+
+    def _temperature(self, temperature: float) -> dict:
+        return {} if self._reasoning_model else {"temperature": temperature}
 
     # -- json --
     def call_json(
@@ -245,7 +245,7 @@ class OpenAIProvider(LLMProvider):
                 {"role": "system", "content": prompt_sys},
                 {"role": "user", "content": prompt_user},
             ],
-            "temperature": temperature,
+            **self._temperature(temperature),
             self._max_tokens_key: 16384,
         }
         if self._reasoning_effort:
@@ -283,7 +283,7 @@ class OpenAIProvider(LLMProvider):
                 kwargs: dict = {
                     "model": self._model,
                     "messages": messages,
-                    "temperature": temperature,
+                    **self._temperature(temperature),
                     "response_format": response_format,
                     self._max_tokens_key: 16384,
                 }

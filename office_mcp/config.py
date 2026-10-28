@@ -80,7 +80,8 @@ OPENAI_MODEL_NAME: str = "gpt-5.1"
 OPENROUTER_MODEL_NAME: str = "openai/gpt-oss-120b"
 GEMINI_MODEL_NAME: str = "gemini-3.1-flash-image-preview"
 # LLM_CUSTOM_MODEL_NAME: str = "/models/openai/gpt-oss-120b"
-LLM_CUSTOM_MODEL_NAME: str = "frentis-ai-model"
+# CUSTOM_LLM_MODEL: the model on that endpoint (Process GPT Lite passes its LLM_MODEL)
+LLM_CUSTOM_MODEL_NAME: str = _env_optional("CUSTOM_LLM_MODEL") or "frentis-ai-model"
 
 _MODEL_MAP = {
     "openai": OPENAI_MODEL_NAME,
